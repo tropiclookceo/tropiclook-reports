@@ -229,17 +229,18 @@ class InputData:
         for row in raw_res:
             if row[0] is None:
                 continue
+            def _r(i, d=None): return row[i] if len(row) > i else d
             r = {
-                "booking_id":   str(row[0] or "").strip(),
-                "channel":      str(row[1] or "").strip(),
-                "checkin":      _parse_date(row[2]),
-                "checkout":     _parse_date(row[3]),
-                "nights":       _to_int(row[4], 0),
-                "gross":        _to_float(row[5], 0),
-                "ota_comm":     _to_float(row[6], 0),
-                "tl_comm":      _to_float(row[7], 0),
-                "net_to_owner": _to_float(row[8], 0),
-                "status":       str(row[9] or "confirmed").strip(),
+                "booking_id":   str(_r(0) or "").strip(),
+                "channel":      str(_r(1) or "").strip(),
+                "checkin":      _parse_date(_r(2)),
+                "checkout":     _parse_date(_r(3)),
+                "nights":       _to_int(_r(4), 0),
+                "gross":        _to_float(_r(5), 0),
+                "ota_comm":     _to_float(_r(6), 0),
+                "tl_comm":      _to_float(_r(7), 0),
+                "net_to_owner": _to_float(_r(8), 0),
+                "status":       str(_r(9) or "confirmed").strip(),
             }
             if r["booking_id"]:
                 self.reservations.append(r)
@@ -286,7 +287,7 @@ class InputData:
                 "type":        str(row[2] or "Bank Transfer").strip(),
                 "reference":   str(row[3] or "").strip(),
                 "description": str(row[4] or "").strip(),
-                "notes":       str(row[5] or "").strip(),
+                "notes":       str(row[5] or "").strip() if len(row) > 5 else "",
             }
             if p["amount"] > 0:
                 self.payouts.append(p)
