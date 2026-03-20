@@ -300,11 +300,12 @@ class InputData:
             if row[0] is None:
                 continue
             code = str(row[0] or "").strip().upper()
+            def _rb(i, d=None): return row[i] if len(row) > i else d
             self.opex_budget[code] = {
-                "name":   str(row[1] or code).strip(),
-                "budget": _to_float(row[2], 0),
-                "type":   str(row[3] or "").strip(),
-                "notes":  str(row[4] or "").strip(),
+                "name":   str(_rb(1) or code).strip(),
+                "budget": _to_float(_rb(2), 0),
+                "type":   str(_rb(3) or "").strip(),
+                "notes":  str(_rb(4) or "").strip(),
             }
 
         # ── Prior_Period ──
