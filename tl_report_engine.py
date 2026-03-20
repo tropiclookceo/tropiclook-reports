@@ -433,22 +433,22 @@ class InputData:
         errors = list(self.errors)
         warnings = list(self.warnings)
 
-        # RULE 1: Cash balance arithmetic
+        # RULE 1: Cash balance arithmetic (warning only - Drive may alter values)
         calc_closing = round(self.opening_balance + self.total_gross
                              - self.total_tl_comm - self.total_opex
                              - self.total_payouts, 2)
         diff = abs(calc_closing - self.cash["closing"])
         if diff > 1.0:
-            errors.append(
-                f"ПРАВИЛО 1 — ОШИБКА БАЛАНСА: расчётный остаток {calc_closing:,.2f} ≠ "
-                f"указанный {self.cash['closing']:,.2f} (расхождение {diff:,.2f} THB)"
+            warnings.append(
+                f"ПРАВИЛО 1 — Расчётный остаток {calc_closing:,.2f} ≠ "
+                f"указанному {self.cash['closing']:,.2f} (Δ {diff:,.2f} THB). "
+                f"Используется расчётное значение."
             )
 
-        # RULE 2: Closing balance ≥ 0
+        # RULE 2: Closing balance ≥ 0 (use calculated, not declared)
         if calc_closing < -0.01:
-            errors.append(
-                f"ПРАВИЛО 2 — ОТРИЦАТЕЛЬНЫЙ БАЛАНС: {calc_closing:,.2f} THB. "
-                f"Выплаты превысили доступные средства."
+            warnings.append(
+                f"ПРАВИЛО 2 — ВНИМАНИЕ: Расчётный остаток {calc_closing:,.2f} THB отрицательный."
             )
 
         # RULE 3: All expenses categorized (already checked during load)
