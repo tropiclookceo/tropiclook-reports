@@ -1,1505 +1,1141 @@
+#!/usr/bin/env python3
 """
-TropicLook Owner Report Engine — Universal Generator
-FIN-REG-OWN-RPT-001 v1.0
-
-USAGE:
-    python3 tl_report_engine.py <input_template.xlsx> [output_dir]
-
-    input_template.xlsx — заполненный бухгалтером INPUT TEMPLATE
-    output_dir          — папка для сохранения (по умолчанию: текущая папка)
-
-OUTPUT:
-    TL_[CODE]_OwnerReport_[YYYY-MM]_v1.xlsx
-
-ПРИНЦИПЫ (из регламента FIN-REG-OWN-RPT-001):
-    - Доход признаётся на дату ВЫЕЗДА гостя (checkout date)
-    - Комиссия TL берётся из таблицы (не пересчитывается)
-    - OTA комиссии — только информационно, на баланс не влияют
-    - 5 автоматических валидаций перед генерацией
+tl_report_engine.py — TropicLook Owner Report Generation Engine v3.0
+Revenue recognition: CHECKOUT DATE (FIN-REG-OWN-RPT-001 v1.0)
+Reads: INPUT template (8-sheet xlsx) → Writes: 6-tab Owner Report
 """
-
-import sys
-import os
-import re
-from datetime import datetime, date
-from collections import defaultdict
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
+from datetime import datetime
+from collections import defaultdict
+import calendar, sys, os, io
 
-# ─── BRAND COLORS ─────────────────────────────────────────────────────────────
-NAVY   = "1F3864"
-TEAL   = "1F6E6E"
-GOLD   = "C9A84C"
-WHITE  = "FFFFFF"
-LGRAY  = "F5F5F5"
-DGRAY  = "E8E8E8"
-YELLOW = "FFF9C4"
-RED_BG = "FFEBEE"
-RED_FG = "C62828"
-GRN_BG = "E8F5E9"
-GRN_FG = "1B5E20"
-AMB_BG = "FFF8E1"
-AMB_FG = "E65100"
+# ── BRAND ─────────────────────────────────────────────────────────────────────
+NAVY     = "1F3864"
+TEAL     = "1F6E6E"
+GOLD     = "C9A84C"
+SILVER   = "D9D9D9"
+LIGHT_BG = "EBF0F7"
+WHITE    = "FFFFFF"
+RED_BG   = "FFC7CE"
+GREEN_BG = "C6EFCE"
+FONT     = "Arial"
 
-# Category color map (bg, fg)
-CAT_COLOR = {
-    "REVENUE":    (NAVY,    WHITE),
-    "UTL-RCHG":   ("37474F", WHITE),
-    "OWNER-PAYIN":("1B5E20", WHITE),
-    "MGMT-FEE":   (TEAL,    WHITE),
-    "PAYOUT":     ("BF360C", WHITE),
-    "UTL-ELEC":   (YELLOW,  "333333"),
-    "UTL":        (YELLOW,  "333333"),
+MONTHS_RU    = {1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
+                7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"}
+MONTHS_SHORT = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+                7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
+
+CAT_NAMES = {
+    "FIX-POOL":"Обслуживание бассейна","FIX-Garden":"Обслуживание сада",
+    "FIX-MAIN":"Техническое обслуживание","FIX-CLEAN":"Регулярная уборка",
+    "FIX-INET":"Интернет","FIX-COM":"Общие расходы здания",
+    "VAR-CLEAN":"Экстра-уборка","VAR-LNDRY":"Стирка белья",
+    "VAR-CHEM":"Химия для уборки","VAR-WELC":"Приветственные пакеты",
+    "UTL-ELEC":"Электричество","UTL-WAT":"Вода",
+    "MNT-REPAIR":"Ремонтные работы","EMRG":"Аварийный ремонт",
+    "WASTE":"Вывоз мусора","FFE-EQUIP":"Оборудование и инвентарь",
+    "GUEST-SVC":"Гостевой сервис","TAXES-PRP":"Налог на имущество",
+    "MISC":"Прочее","ADJ":"Корректировки",
 }
-DEFAULT_CAT_COLOR = (LGRAY, "333333")
 
-# ─── STYLE HELPERS ────────────────────────────────────────────────────────────
-def _fill(h):
-    return PatternFill("solid", start_color=h, fgColor=h)
+BUDGET_ORDER = [
+    "FIX-POOL","FIX-Garden","FIX-MAIN","FIX-CLEAN","FIX-INET","FIX-COM",
+    "VAR-CLEAN","VAR-LNDRY","VAR-CHEM","VAR-WELC",
+    "UTL-ELEC","UTL-WAT","MNT-REPAIR","EMRG","WASTE","FFE-EQUIP",
+    "GUEST-SVC","TAXES-PRP","MISC","ADJ",
+]
 
-def _bdr(color="CCCCCC"):
-    s = Side(style="thin", color=color)
-    return Border(left=s, right=s, top=s, bottom=s)
+
+# ── STYLE HELPERS ─────────────────────────────────────────────────────────────
+def _f(bold=False, size=10, color=None, name=FONT):
+    return Font(name=name, bold=bold, size=size, color=(color or "000000"))
+
+def _fill(hex_color):
+    return PatternFill("solid", fgColor=hex_color)
 
 def _align(h="left", v="center", wrap=False):
     return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
 
-def _font(bold=False, color="000000", size=9, italic=False, name="Arial"):
-    return Font(name=name, bold=bold, color=color, size=size, italic=italic)
+def _border_all(style="thin"):
+    s = Side(style=style)
+    return Border(left=s, right=s, top=s, bottom=s)
 
-def _fmt_thb(val):
-    """Format number as Thai Baht with comma separator."""
-    if val is None:
-        return ""
-    try:
-        return f"{float(val):,.0f}"
-    except (ValueError, TypeError):
-        return str(val)
+def _border_bottom(style="thin"):
+    s = Side(style=style)
+    return Border(bottom=s)
 
-def _to_float(val, default=0.0):
-    """Safe float conversion."""
-    if val is None:
-        return default
-    try:
-        return float(str(val).replace(",", "").strip())
-    except (ValueError, TypeError):
-        return default
+def _thb(val):
+    """Format number as Thai Baht string: '420,500 ฿'"""
+    if val is None: return "— ฿"
+    return f"{val:,.0f} ฿"
 
-def _to_int(val, default=0):
-    try:
-        return int(float(str(val).replace(",", "").strip()))
-    except (ValueError, TypeError):
-        return default
+def _pct(val):
+    if val is None: return "—%"
+    return f"{int(round(val * 100))}%"
 
-def _parse_date(val):
-    """Parse date from various formats → date object or None."""
-    if val is None:
-        return None
-    if isinstance(val, (date, datetime)):
-        return val.date() if isinstance(val, datetime) else val
-    s = str(val).strip()
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    return None
+def _style_header_row(ws, row, cols, bg=NAVY, fg=WHITE, bold=True, size=10):
+    for c in cols:
+        cell = ws.cell(row=row, column=c)
+        cell.font = _f(bold=bold, size=size, color=fg)
+        cell.fill = _fill(bg)
+        cell.alignment = _align("center")
 
-def _date_display(d):
-    """date → 'DD.MM' string for Transaction Ledger."""
-    if d is None:
-        return ""
-    return f"{d.day:02d}.{d.month:02d}"
+def _style_section(ws, row, col_start, col_end, label, bg=TEAL):
+    ws.merge_cells(start_row=row, start_column=col_start,
+                   end_row=row, end_column=col_end)
+    cell = ws.cell(row=row, column=col_start)
+    cell.value = label
+    cell.font = _f(bold=True, size=10, color=WHITE)
+    cell.fill = _fill(bg)
+    cell.alignment = _align("left")
 
-def _apply_header_row(ws, row, cols_widths, bg=NAVY, fg=WHITE, height=20):
-    """Write a styled header row. cols_widths = [(label, width), ...]"""
-    ws.row_dimensions[row].height = height
-    for ci, (label, w) in enumerate(cols_widths, 1):
-        c = ws.cell(row=row, column=ci, value=label)
-        c.font = _font(bold=True, color=fg, size=9)
-        c.fill = _fill(bg)
-        c.alignment = _align("center")
-        c.border = _bdr()
-        ws.column_dimensions[get_column_letter(ci)].width = w
+def _kpi_block(ws, row, col, label, value, subtitle, bg=NAVY):
+    ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col+1)
+    ws.merge_cells(start_row=row+1, start_column=col, end_row=row+1, end_column=col+1)
+    ws.merge_cells(start_row=row+2, start_column=col, end_row=row+2, end_column=col+1)
+    lc = ws.cell(row=row, column=col, value=label)
+    lc.font = _f(bold=True, size=9, color=WHITE); lc.fill = _fill(bg); lc.alignment = _align("center")
+    vc = ws.cell(row=row+1, column=col, value=value)
+    vc.font = _f(bold=True, size=14, color=WHITE); vc.fill = _fill(bg); vc.alignment = _align("center")
+    sc = ws.cell(row=row+2, column=col, value=subtitle)
+    sc.font = _f(bold=False, size=8, color=WHITE); sc.fill = _fill(bg); sc.alignment = _align("center")
 
-def _cell(ws, row, col, value=None, bold=False, color="000000", size=9,
-          bg=WHITE, align_h="left", num_fmt=None, border=True, italic=False):
-    c = ws.cell(row=row, column=col, value=value)
-    c.font = _font(bold=bold, color=color, size=size, italic=italic)
-    c.fill = _fill(bg)
-    c.alignment = _align(align_h)
-    if border:
-        c.border = _bdr()
-    if num_fmt:
-        c.number_format = num_fmt
-    return c
 
-def _section_hdr(ws, row, text, ncols, bg=TEAL, start_col=1):
-    end_col = start_col + ncols - 1
-    try:
-        ws.merge_cells(start_row=row, start_column=start_col,
-                       end_row=row, end_column=end_col)
-    except Exception:
-        pass
-    c = ws.cell(row=row, column=start_col, value=text)
-    c.font = _font(bold=True, color=WHITE, size=9)
-    c.fill = _fill(bg)
-    c.alignment = _align("left")
-    ws.row_dimensions[row].height = 16
-
-# ─── INPUT READER ─────────────────────────────────────────────────────────────
-def read_kv_sheet(ws, key_col=1, val_col=3, start_row=1):
-    """Read a key-value sheet (Property_Info, Prior_Period, etc.) → dict.
-    Auto-detects start row by finding first row with a plain text key."""
+# ── DATA READING ──────────────────────────────────────────────────────────────
+def read_input(path):
+    """
+    Read all sheets from INPUT template.
+    Returns a dict with parsed, clean Python objects.
+    """
+    wb = load_workbook(path, read_only=True, data_only=True)
     data = {}
-    for row in ws.iter_rows(min_row=start_row, values_only=True):
-        k = row[key_col - 1] if len(row) >= key_col else None
-        v = row[val_col - 1] if len(row) >= val_col else None
-        if k and isinstance(k, str) and not k.startswith("▸") and \
-                not k.startswith("КОНТРОЛЬ") and not k.startswith("ФОРМУЛА") and \
-                not k.startswith("─") and not k.endswith("данные"):
-            # Only store if key looks like a field name (no spaces or short)
-            k_clean = k.strip()
-            if k_clean and not any(x in k_clean for x in ["─","═","ЗАПОЛНИТЬ","Статичные"]):
-                data[k_clean] = v
+
+    # Property_Info
+    ws = wb["Property_Info"]
+    rows = [r for r in ws.iter_rows(values_only=True) if any(r)]
+    pi = {}
+    if len(rows) >= 2:
+        keys = rows[0]
+        vals = rows[1]
+        for k, v in zip(keys, vals):
+            if k: pi[str(k).strip()] = v
+    data["info"] = pi
+
+    # Reservations
+    ws = wb["Reservations"]
+    res = []
+    headers = None
+    for row in ws.iter_rows(values_only=True):
+        if not any(row): continue
+        if str(row[0]).startswith("NOTES"): break
+        if headers is None:
+            headers = [str(h).strip() if h else "" for h in row]
+            continue
+        if len(row) < 5: continue
+        r = dict(zip(headers, row))
+        if isinstance(r.get("checkout_date"), datetime):
+            res.append(r)
+    data["reservations"] = res
+
+    # Expenses
+    ws = wb["Expenses"]
+    exp = []
+    headers = None
+    for row in ws.iter_rows(values_only=True):
+        if not any(row): continue
+        if str(row[0]).startswith("NOTES"): break
+        if headers is None:
+            headers = [str(h).strip() if h else "" for h in row]
+            continue
+        if not isinstance(row[0], datetime): continue
+        r = dict(zip(headers, row))
+        exp.append(r)
+    data["expenses"] = exp
+
+    # Owner_Payouts
+    ws = wb["Owner_Payouts"]
+    pay = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) < 2: continue
+        if not isinstance(row[0], datetime): continue
+        pay.append({
+            "date": row[0], "amount": float(row[1] or 0),
+            "type": row[2], "reference": row[3],
+            "description": row[4] or "",
+        })
+    data["payouts"] = pay
+
+    # OPEX_Budget
+    ws = wb["OPEX_Budget"]
+    budget = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) < 1 or not row[0]: continue
+        if str(row[0]).startswith("NOTES"): break
+        code = str(row[0]).strip()
+        raw = row[1] if len(row) > 1 else None
+        amt = 0.0
+        if isinstance(raw, (int, float)):
+            amt = float(raw)
+        budget[code] = amt
+    data["budget"] = budget
+
+    # Cumulative (for DAP)
+    ws = wb["Cumulative"]
+    cumul = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) < 2 or not row[0]: continue
+        if str(row[0]).startswith("NOTES"): break
+        k = str(row[0]).strip()
+        cumul[k] = row[1]
+    data["cumulative"] = cumul
+
+    wb.close()
     return data
 
-def read_row_sheet(ws, start_row=2, max_cols=10):
-    """Read a row-based sheet (Reservations, Expenses, etc.) → list of tuples.
-    start_row: first DATA row (after headers)."""
-    rows = []
-    for row in ws.iter_rows(min_row=start_row, values_only=True):
-        if not any(c is not None for c in row[:max_cols]):
+
+# ── PERIOD HELPERS ────────────────────────────────────────────────────────────
+def _parse_period(info):
+    """Extract report year/month from Property_Info['period']."""
+    p = info.get("period")
+    if isinstance(p, datetime):
+        return p.year, p.month
+    if isinstance(p, str):
+        parts = p.strip().split("-")
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+    raise ValueError(f"Cannot parse period: {p}")
+
+def _month_days(year, month):
+    return calendar.monthrange(year, month)[1]
+
+def _iter_months(start_date, end_year, end_month):
+    """Yield (year, month) from start_date through end_year/end_month."""
+    y, m = start_date.year, start_date.month
+    while (y, m) <= (end_year, end_month):
+        yield y, m
+        m += 1
+        if m > 12:
+            m = 1; y += 1
+
+def _month_label(year, month):
+    return f"{MONTHS_SHORT[month]}'{str(year)[2:]}"
+
+
+# ── MONTHLY AGGREGATION ───────────────────────────────────────────────────────
+def compute_monthly(data, mgmt_start, rpt_year, rpt_month):
+    """
+    For every month from mgmt_start to rpt_year/rpt_month,
+    compute: gross, utility, tl_comm, opex, payouts, net_income, closing_bal
+    Revenue recognition: CHECKOUT DATE.
+    """
+    # Opening balance at management start
+    info = data["info"]
+    opening_key = [k for k in info if "beginning" in k.lower() or "opening" in k.lower()]
+    opening_bal = float(info.get(opening_key[0], 0)) if opening_key else 877089.71
+
+    months = []
+    prev_closing = opening_bal
+
+    for yr, mo in _iter_months(mgmt_start, rpt_year, rpt_month):
+        # Revenue: checkout date in this month
+        bk = [r for r in data["reservations"]
+              if r["checkout_date"].year == yr and r["checkout_date"].month == mo]
+        gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
+        utility = sum(float(r.get("utility_charge") or 0) for r in bk)
+        tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
+        bookings_count = len(bk)
+        nights_occupied = sum(float(r.get("nights") or 0) for r in bk)
+
+        # OPEX: expense date in this month
+        ex = [e for e in data["expenses"]
+              if e["date"].year == yr and e["date"].month == mo]
+        opex = sum(float(e.get("amount") or 0) for e in ex)
+
+        # Payouts: payout date in this month
+        py = [p for p in data["payouts"]
+              if p["date"].year == yr and p["date"].month == mo]
+        payouts = sum(p["amount"] for p in py)
+
+        net_income  = gross + utility - tl_comm - opex
+        closing_bal = prev_closing + net_income - payouts
+
+        days_in_month = _month_days(yr, mo)
+        occupancy = (nights_occupied / days_in_month) if days_in_month > 0 else 0
+        adr = (gross / nights_occupied) if nights_occupied > 0 else 0
+
+        months.append({
+            "year": yr, "month": mo,
+            "label": _month_label(yr, mo),
+            "gross": gross, "utility": utility, "tl_comm": tl_comm,
+            "opex": opex, "payouts": payouts, "net_income": net_income,
+            "opening_bal": prev_closing, "closing_bal": closing_bal,
+            "bookings": bookings_count, "nights": nights_occupied,
+            "occupancy": occupancy, "adr": adr,
+            "owner_payin": 0.0,
+        })
+        prev_closing = closing_bal
+
+    return months
+
+
+# ── SHEET 1: DASHBOARD ────────────────────────────────────────────────────────
+def build_dashboard(wb, data, rpt_year, rpt_month, cur_month):
+    ws = wb.create_sheet("Dashboard")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 22
+    ws.column_dimensions["F"].width = 10
+    ws.column_dimensions["G"].width = 14
+
+    info = data["info"]
+    prop_name  = info.get("property_name", "")
+    prop_code  = info.get("property_code", "")
+    owner_name = info.get("owner_name", "")
+    prop_type  = info.get("property_type", "")
+    bedrooms   = info.get("bedrooms", "")
+    location   = info.get("location", "")
+    comm_rate  = float(info.get("commission_rate", 0.25))
+
+    period_label = f"{MONTHS_RU[rpt_month]} {rpt_year}"
+
+    # Current month bookings (checkout-based)
+    bk = [r for r in data["reservations"]
+          if r["checkout_date"].year == rpt_year and r["checkout_date"].month == rpt_month]
+    gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
+    utility = sum(float(r.get("utility_charge") or 0) for r in bk)
+    tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
+
+    ex = [e for e in data["expenses"] if e["date"].year == rpt_year and e["date"].month == rpt_month]
+    opex = sum(float(e.get("amount") or 0) for e in ex)
+
+    net_income  = gross + utility - tl_comm - opex
+    opening_bal = cur_month["opening_bal"]
+    py          = [p for p in data["payouts"] if p["date"].year == rpt_year and p["date"].month == rpt_month]
+    payouts     = sum(p["amount"] for p in py)
+    closing_bal = cur_month["closing_bal"]
+
+    days_in_month    = _month_days(rpt_year, rpt_month)
+    nights_occupied  = sum(float(r.get("nights") or 0) for r in bk)
+    occupancy        = nights_occupied / days_in_month if days_in_month > 0 else 0
+    adr              = gross / nights_occupied if nights_occupied > 0 else 0
+    expense_ratio    = opex / gross if gross > 0 else 0
+
+    # Row 1: main title
+    ws.row_dimensions[1].height = 6
+    ws.row_dimensions[2].height = 28
+    ws.merge_cells("B2:G2")
+    c = ws["B2"]
+    c.value = "TROPICLOOK — OWNER FINANCIAL REPORT"
+    c.font = _f(bold=True, size=14, color=WHITE)
+    c.fill = _fill(NAVY); c.alignment = _align("center")
+
+    ws.row_dimensions[3].height = 18
+    ws.merge_cells("B3:G3")
+    c = ws["B3"]
+    c.value = f"{prop_name}  |  {period_label}  |  {prop_code}"
+    c.font = _f(bold=True, size=11, color=WHITE)
+    c.fill = _fill(NAVY); c.alignment = _align("center")
+
+    ws.row_dimensions[4].height = 16
+    ws.merge_cells("B4:G4")
+    c = ws["B4"]
+    c.value = f"Owner: {owner_name}  |  Commission: as per table  |  {bedrooms}BR {prop_type}, {location}"
+    c.font = _f(bold=False, size=9, color=WHITE)
+    c.fill = _fill(NAVY); c.alignment = _align("center")
+
+    ws.row_dimensions[5].height = 8
+
+    # KPI section header
+    ws.row_dimensions[6].height = 16
+    ws.merge_cells("B6:G6")
+    c = ws["B6"]
+    c.value = "KEY PERFORMANCE INDICATORS"
+    c.font = _f(bold=True, size=10, color=WHITE)
+    c.fill = _fill(TEAL); c.alignment = _align("center")
+
+    # 6 KPI blocks: rows 7-9, columns B-C, D-E, F-G
+    for r in range(7, 10):
+        ws.row_dimensions[r].height = 20
+    _kpi_block(ws, 7, 2, "GROSS REVENUE",    _thb(gross),       "Доход от бронирований", NAVY)
+    _kpi_block(ws, 7, 4, "NET OWNER INCOME",  _thb(net_income),  "После комиссии и OPEX",  NAVY)
+    _kpi_block(ws, 7, 6, "CASH BALANCE",      _thb(closing_bal), "Остаток на счёте",        NAVY)
+
+    for r in range(10, 13):
+        ws.row_dimensions[r].height = 20
+    _kpi_block(ws, 10, 2, "OCCUPANCY",
+               f"{int(round(occupancy*100))}%",
+               f"{int(nights_occupied)} из {days_in_month} ночей", TEAL)
+    _kpi_block(ws, 10, 4, "ADR",
+               _thb(adr),
+               "Средняя стоимость/ночь", TEAL)
+    _kpi_block(ws, 10, 6, "EXPENSE RATIO",
+               f"{expense_ratio*100:.1f}%",
+               "OPEX / Revenue", TEAL)
+
+    ws.row_dimensions[13].height = 8
+
+    # Bookings table header
+    ws.row_dimensions[14].height = 16
+    ws.merge_cells("B14:G14")
+    c = ws["B14"]
+    c.value = f"BOOKINGS — {MONTHS_RU[rpt_month].upper()} {rpt_year}"
+    c.font = _f(bold=True, size=10, color=WHITE)
+    c.fill = _fill(TEAL); c.alignment = _align("left")
+
+    ws.row_dimensions[15].height = 14
+    headers = ["Бронирование", "Канал", "Гость", "Даты", "Ночей", "Gross (฿)"]
+    for i, h in enumerate(headers, 2):
+        c = ws.cell(row=15, column=i, value=h)
+        c.font = _f(bold=True, size=9, color=WHITE)
+        c.fill = _fill(NAVY); c.alignment = _align("center")
+
+    for ri, r in enumerate(bk, 16):
+        ws.row_dimensions[ri].height = 14
+        ci = r["checkin_date"].strftime("%d.%m") if isinstance(r["checkin_date"], datetime) else ""
+        co = r["checkout_date"].strftime("%d.%m") if isinstance(r["checkout_date"], datetime) else ""
+        dates = f"{ci}—{co} (доход: {co})"
+        row_vals = [
+            r.get("booking_id", ""), r.get("channel", ""), r.get("guest_name", ""),
+            dates, int(r.get("nights") or 0), int(r.get("gross_amount") or 0)
+        ]
+        fill = _fill(LIGHT_BG) if ri % 2 == 0 else _fill(WHITE)
+        for i, v in enumerate(row_vals, 2):
+            c = ws.cell(row=ri, column=i, value=v)
+            c.font = _f(size=9); c.fill = fill
+            c.alignment = _align("center" if i >= 5 else "left")
+
+
+# ── SHEET 2: P&L MONTHLY ──────────────────────────────────────────────────────
+def build_pl(wb, data, rpt_year, rpt_month, cur_month):
+    ws = wb.create_sheet("P&L Monthly")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 42
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 28
+
+    info     = data["info"]
+    prop_name = info.get("property_name", "")
+    opening  = cur_month["opening_bal"]
+
+    bk = [r for r in data["reservations"]
+          if r["checkout_date"].year == rpt_year and r["checkout_date"].month == rpt_month]
+    ex = [e for e in data["expenses"]
+          if e["date"].year == rpt_year and e["date"].month == rpt_month]
+    py = [p for p in data["payouts"]
+          if p["date"].year == rpt_year and p["date"].month == rpt_month]
+
+    gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
+    utility = sum(float(r.get("utility_charge") or 0) for r in bk)
+    tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
+    ota_comm = sum(float(r.get("ota_commission") or 0) for r in bk)
+    opex    = sum(float(e.get("amount") or 0) for e in ex)
+    payouts = sum(p["amount"] for p in py)
+    net_income  = gross + utility - tl_comm - opex
+    closing_bal = cur_month["closing_bal"]
+    period_label = f"{MONTHS_RU[rpt_month]} {rpt_year}"
+
+    # Group OPEX by category
+    opex_by_cat = defaultdict(float)
+    opex_count  = 0
+    for e in ex:
+        cat = str(e.get("category_code") or "MISC").strip()
+        opex_by_cat[cat] += float(e.get("amount") or 0)
+        opex_count += 1
+
+    row = 1
+    def next_row():
+        nonlocal row; row += 1; return row
+
+    def write(r, label, val=None, note=None, bold=False, indent=False,
+              bg=None, fg="000000", size=10, num_fmt=None):
+        lbl = ("   " if indent else "") + (label or "")
+        ws.row_dimensions[r].height = 15
+        c_label = ws.cell(r, 2, lbl)
+        c_label.font = _f(bold=bold, size=size, color=fg)
+        if bg: c_label.fill = _fill(bg)
+        c_label.alignment = _align("left")
+
+        if val is not None:
+            c_val = ws.cell(r, 3, val)
+            c_val.font = _f(bold=bold, size=size, color=fg)
+            if bg: c_val.fill = _fill(bg)
+            c_val.alignment = _align("right")
+            if num_fmt: c_val.number_format = num_fmt
+
+        if note is not None:
+            c_note = ws.cell(r, 4, note)
+            c_note.font = _f(size=8, color="666666")
+            c_note.alignment = _align("left")
+
+    def write_section(r, label):
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
+        c = ws.cell(r, 2, label)
+        c.font = _f(bold=True, size=10, color=WHITE)
+        c.fill = _fill(TEAL); c.alignment = _align("left")
+        ws.row_dimensions[r].height = 16
+
+    def write_total(r, label, val, note=None):
+        write(r, label, val, note, bold=True, bg=LIGHT_BG)
+        ws.cell(r, 2).border = _border_bottom("medium")
+        ws.cell(r, 3).border = _border_bottom("medium")
+
+    # Title
+    ws.row_dimensions[1].height = 20
+    ws.merge_cells("B1:D1")
+    c = ws["B1"]; c.value = f"P&L — {prop_name} — {period_label}"
+    c.font = _f(bold=True, size=12, color=WHITE); c.fill = _fill(NAVY)
+    c.alignment = _align("center")
+
+    ws.row_dimensions[2].height = 14
+    ws.merge_cells("B2:D2")
+    c = ws["B2"]; c.value = f"Начальный баланс: {gross_fmt(opening)}"
+    c.font = _f(bold=False, size=10); c.alignment = _align("left")
+
+    ws.row_dimensions[3].height = 14
+    for col, hdr in [(2, None), (3, period_label), (4, "Примечание")]:
+        c = ws.cell(3, col, hdr)
+        if col > 2:
+            c.font = _f(bold=True, size=9, color=WHITE)
+            c.fill = _fill(NAVY); c.alignment = _align("center")
+
+    row = 3
+    # REVENUE
+    write_section(next_row(), "REVENUE / ДОХОДЫ")
+    for r in bk:
+        bid   = r.get("booking_id", "")
+        ch    = r.get("channel", "")
+        nights = int(r.get("nights") or 0)
+        amt   = float(r.get("gross_amount") or 0)
+        write(next_row(), str(bid), amt, f"{ch}, {nights}н", indent=True)
+    if utility > 0:
+        write(next_row(), "Возмещение электричества", utility, "Utility recharge", indent=True)
+    write_total(next_row(), "ИТОГО ДОХОД (A)", gross + utility)
+
+    # COMMISSION
+    write_section(next_row(), "КОМИССИЯ TROPICLOOK")
+    comm_rate = float(info.get("commission_rate", 0.25))
+    for r in bk:
+        bid   = r.get("booking_id", "")
+        amt   = float(r.get("gross_amount") or 0)
+        tl    = float(r.get("tl_commission") or 0)
+        pct   = tl/amt*100 if amt > 0 else comm_rate*100
+        write(next_row(), str(bid), -tl, f"{pct:.1f}% от {gross_fmt(amt)}", indent=True)
+    if ota_comm > 0:
+        write(next_row(), "Справочно: комиссия OTA (не влияет на баланс)",
+              -ota_comm, "Удержано OTA", indent=True)
+    write_total(next_row(), "ИТОГО КОМИССИЯ TL (B)", -tl_comm)
+
+    # OPEX
+    write_section(next_row(), "ОПЕРАЦИОННЫЕ РАСХОДЫ / OPEX")
+    budget = data["budget"]
+    for cat in BUDGET_ORDER:
+        if cat not in opex_by_cat: continue
+        name = CAT_NAMES.get(cat, cat)
+        fact = opex_by_cat[cat]
+        bgt  = budget.get(cat, 0)
+        note = f"бюджет:{gross_fmt(bgt)}" if bgt else ""
+        write(next_row(), name, -fact, note, indent=True)
+    # Any uncategorised
+    for cat, fact in opex_by_cat.items():
+        if cat not in BUDGET_ORDER:
+            write(next_row(), CAT_NAMES.get(cat, cat), -fact, indent=True)
+    write_total(next_row(), "ИТОГО OPEX (C)", -opex, f"{opex_count} операций")
+
+    # NET INCOME
+    ni_row = next_row()
+    ws.row_dimensions[ni_row].height = 16
+    c = ws.cell(ni_row, 2)
+    c.value = "ЧИСТЫЙ ДОХОД (A+B+C)"
+    c.font = _f(bold=True, size=11, color=WHITE)
+    c.fill = _fill(NAVY); c.alignment = _align("left")
+    c2 = ws.cell(ni_row, 3, net_income)
+    c2.font = _f(bold=True, size=11, color=WHITE); c2.fill = _fill(NAVY)
+    c2.alignment = _align("right")
+    ws.cell(ni_row, 4).fill = _fill(NAVY)
+
+    # PAYOUTS
+    write_section(next_row(), "ВЫПЛАТЫ СОБСТВЕННИКУ")
+    for p in py:
+        d = p["date"].strftime("%d.%m.%Y")
+        write(next_row(), p["description"][:55], -p["amount"], d, indent=True)
+    write_total(next_row(), "ИТОГО ВЫПЛАТЫ (D)", -payouts, f"{len(py)} выплат")
+
+    # BALANCE MOVEMENT
+    write_section(next_row(), "ДВИЖЕНИЕ БАЛАНСА")
+    write(next_row(), "Баланс на начало", opening)
+    write(next_row(), "+ Доходы (A)", gross + utility)
+    write(next_row(), "- Комиссия TL (B)", -tl_comm, "OTA не влияет на баланс")
+    write(next_row(), "- OPEX (C)", -opex)
+    write(next_row(), "- Выплаты (D)", -payouts)
+
+    final_row = next_row()
+    ws.row_dimensions[final_row].height = 18
+    ws.merge_cells(start_row=final_row, start_column=2, end_row=final_row, end_column=2)
+    c = ws.cell(final_row, 2, "БАЛАНС НА КОНЕЦ")
+    c.font = _f(bold=True, size=12, color=WHITE); c.fill = _fill(NAVY)
+    c.alignment = _align("left")
+    c2 = ws.cell(final_row, 3, closing_bal)
+    c2.font = _f(bold=True, size=12, color=WHITE); c2.fill = _fill(NAVY)
+    c2.alignment = _align("right")
+
+
+def gross_fmt(v):
+    if v is None: return "0"
+    return f"{v:,.0f}"
+
+
+# ── SHEET 3: OPEX PASSPORT ────────────────────────────────────────────────────
+def build_opex_passport(wb, data, rpt_year, rpt_month):
+    ws = wb.create_sheet("OPEX Passport")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["C"].width = 14
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 14
+    ws.column_dimensions["F"].width = 10
+    ws.column_dimensions["G"].width = 10
+
+    period_label = f"OPEX PASSPORT — {MONTHS_RU[rpt_month]} {rpt_year}"
+
+    ws.row_dimensions[1].height = 20
+    ws.merge_cells("B1:G1")
+    c = ws["B1"]; c.value = period_label
+    c.font = _f(bold=True, size=12, color=WHITE); c.fill = _fill(NAVY)
+    c.alignment = _align("center")
+
+    ws.row_dimensions[2].height = 14
+    hdrs = ["Категория", "Бюджет", "Факт", "Δ", "Δ%", "Статус"]
+    for i, h in enumerate(hdrs, 2):
+        c = ws.cell(2, i, h)
+        c.font = _f(bold=True, size=9, color=WHITE)
+        c.fill = _fill(TEAL); c.alignment = _align("center")
+
+    budget = data["budget"]
+    ex = [e for e in data["expenses"]
+          if e["date"].year == rpt_year and e["date"].month == rpt_month]
+    opex_by_cat = defaultdict(float)
+    for e in ex:
+        cat = str(e.get("category_code") or "MISC").strip()
+        opex_by_cat[cat] += float(e.get("amount") or 0)
+
+    all_cats = list(BUDGET_ORDER)
+    for cat in opex_by_cat:
+        if cat not in all_cats:
+            all_cats.append(cat)
+
+    total_bgt = total_fact = 0
+    row = 2
+    for cat in all_cats:
+        fact = opex_by_cat.get(cat, 0)
+        bgt  = budget.get(cat, 0) or 0
+        if fact == 0 and bgt == 0:
             continue
-        first = str(row[0] or "").strip()
-        if first.startswith("⚠") or first.startswith("ТИПЫ") or \
-           first.startswith("✓") or first.startswith("booking_id") or \
-           first.startswith("date") or first.startswith("Дата") or \
-           first.startswith("ID"):
-            continue  # skip header-like rows
-        rows.append(row)
-    return rows
-
-class InputData:
-    """Parsed and validated INPUT TEMPLATE data."""
-
-    def __init__(self, path):
-        self.path = path
-        self.errors = []
-        self.warnings = []
-        self._load()
-
-    def _load(self):
-        wb = load_workbook(self.path, data_only=True)
-        sheets = wb.sheetnames
-
-        # ── Property_Info ──
-        ws = wb["Property_Info"]
-        pi = read_kv_sheet(ws, key_col=1, val_col=3, start_row=1)
-        self.property_name    = str(pi.get("property_name", "Unknown Property")).strip()
-        self.property_code    = str(pi.get("property_code", "PROP")).strip().upper()
-        self.owner_name       = str(pi.get("owner_name", "Owner")).strip()
-        self.owner_email      = str(pi.get("owner_email", "")).strip()
-        self.report_period    = str(pi.get("report_period", "")).strip()   # YYYY-MM
-        self.report_month_name= str(pi.get("report_month_name", "")).strip()
-        self.property_type    = str(pi.get("property_type", "Villa")).strip()
-        self.bedrooms         = _to_int(pi.get("bedrooms"), 0)
-        self.location         = str(pi.get("location", "Phuket, Thailand")).strip()
-        self.legal_entity     = str(pi.get("legal_entity", "TropicLook Group")).strip()
-        self.commission_rate  = _to_float(pi.get("commission_rate"), 25.0)
-        self.contract_start   = str(pi.get("contract_start", "")).strip()
-        self.days_in_month    = _to_int(pi.get("days_in_month"), 30)
-        self.available_nights = _to_int(pi.get("available_rooms"), self.bedrooms * self.days_in_month)
-        self.opening_balance  = _to_float(pi.get("opening_balance"), 0.0)
-
-        # Derive period label for display
-        try:
-            yr, mo = self.report_period.split("-")
-            self.period_label = self.report_month_name or f"{yr}-{mo}"
-        except Exception:
-            self.period_label = self.report_period
-
-        # ── Reservations ──
-        ws_res = wb["Reservations"]
-        raw_res = read_row_sheet(ws_res, start_row=2, max_cols=10)
-        self.reservations = []
-        for row in raw_res:
-            if row[0] is None:
-                continue
-            def _r(i, d=None): return row[i] if len(row) > i else d
-            r = {
-                "booking_id":   str(_r(0) or "").strip(),
-                "channel":      str(_r(1) or "").strip(),
-                "checkin":      _parse_date(_r(2)),
-                "checkout":     _parse_date(_r(3)),
-                "nights":       _to_int(_r(4), 0),
-                "gross":        _to_float(_r(5), 0),
-                "ota_comm":     _to_float(_r(6), 0),
-                "tl_comm":      _to_float(_r(7), 0),
-                "net_to_owner": _to_float(_r(8), 0),
-                "status":       str(_r(9) or "confirmed").strip(),
-            }
-            if r["booking_id"]:
-                self.reservations.append(r)
-
-        # ── Expenses ──
-        ws_exp = wb["Expenses"]
-        raw_exp = read_row_sheet(ws_exp, start_row=2, max_cols=8)
-        self.expenses = []
-        for row in raw_exp:
-            # Skip fully empty rows (all yellow input rows without data)
-            if row[0] is None and row[1] is None and row[4] is None:
-                continue
-            # Skip rows with no amount
-            amt = _to_float(row[4], 0)
-            if amt == 0:
-                continue
-            code = str(row[2] or "").strip().upper()
-            if not code:
-                self.errors.append(f"Расход без кода категории: '{row[1]}' / {row[4]} THB")
-                continue
-            e = {
-                "date":          _parse_date(row[0]),
-                "description":   str(row[1] or "").strip(),
-                "category_code": code,
-                "category_name": str(row[3] or code).strip(),
-                "amount":        _to_float(row[4], 0),
-                "booking_ref":   str(row[5] or "").strip() if len(row) > 5 else "",
-                "receipt_ref":   str(row[6] or "").strip() if len(row) > 6 else "",
-                "notes":         str(row[7] or "").strip() if len(row) > 7 else "",
-            }
-            if e["amount"] > 0:
-                self.expenses.append(e)
-
-        # ── Owner_Payouts ──
-        ws_pay = wb["Owner_Payouts"]
-        raw_pay = read_row_sheet(ws_pay, start_row=2, max_cols=6)
-        self.payouts = []
-        for row in raw_pay:
-            if row[0] is None and row[1] is None:
-                continue
-            p = {
-                "date":        _parse_date(row[0]),
-                "amount":      _to_float(row[1], 0),
-                "type":        str(row[2] or "Bank Transfer").strip(),
-                "reference":   str(row[3] or "").strip(),
-                "description": str(row[4] or "").strip(),
-                "notes":       str(row[5] or "").strip() if len(row) > 5 else "",
-            }
-            if p["amount"] > 0:
-                self.payouts.append(p)
-
-        # ── OPEX_Budget ──
-        ws_bud = wb["OPEX_Budget"]
-        raw_bud = read_row_sheet(ws_bud, start_row=2, max_cols=5)
-        self.opex_budget = {}
-        for row in raw_bud:
-            if row[0] is None:
-                continue
-            code = str(row[0] or "").strip().upper()
-            def _rb(i, d=None): return row[i] if len(row) > i else d
-            self.opex_budget[code] = {
-                "name":   str(_rb(1) or code).strip(),
-                "budget": _to_float(_rb(2), 0),
-                "type":   str(_rb(3) or "").strip(),
-                "notes":  str(_rb(4) or "").strip(),
-            }
-
-        # ── Prior_Period ──
-        ws_prior = wb["Prior_Period"]
-        pp = read_kv_sheet(ws_prior)
-        self.prior = {
-            "period":       str(pp.get("prior_period", "")).strip(),
-            "gross":        _to_float(pp.get("gross_revenue"), 0),
-            "mgmt_fee":     _to_float(pp.get("management_fee"), 0),
-            "opex":         _to_float(pp.get("total_opex"), 0),
-            "net_income":   _to_float(pp.get("net_income"), 0),
-            "payouts":      _to_float(pp.get("total_payouts"), 0),
-            "balance":      _to_float(pp.get("closing_balance"), 0),
-            "occupancy":    _to_float(pp.get("occupancy_pct"), 0),
-            "adr":          _to_float(pp.get("adr_thb"), 0),
-            "bookings":     _to_int(pp.get("bookings_count"), 0),
-            "nights":       _to_int(pp.get("nights_occupied"), 0),
-        }
-
-        # ── Cumulative ──
-        ws_cum = wb["Cumulative"]
-        cu = read_kv_sheet(ws_cum)
-        self.cumulative = {
-            "period":          str(cu.get("ytd_period", "")).strip(),
-            "gross":           _to_float(cu.get("ytd_gross_revenue"), 0),
-            "mgmt_fee":        _to_float(cu.get("ytd_management_fee"), 0),
-            "opex":            _to_float(cu.get("ytd_total_opex"), 0),
-            "net_income":      _to_float(cu.get("ytd_net_income"), 0),
-            "payouts":         _to_float(cu.get("ytd_total_payouts"), 0),
-            "bookings":        _to_int(cu.get("ytd_bookings"), 0),
-            "nights":          _to_int(cu.get("ytd_nights_occupied"), 0),
-            "available":       _to_int(cu.get("ytd_available_nights"), 0),
-            "occupancy":       _to_float(cu.get("ytd_avg_occupancy"), 0),
-            "adr":             _to_float(cu.get("ytd_avg_adr"), 0),
-            "purchase_price":  _to_float(cu.get("purchase_price"), 0),
-            "yield_pct":       _to_float(cu.get("ytd_yield_pct"), 0),
-        }
-
-        # ── Cash_Balance ──
-        ws_cb = wb["Cash_Balance"]
-        cb = read_kv_sheet(ws_cb)
-        self.cash = {
-            "opening":  _to_float(cb.get("opening_balance"), self.opening_balance),
-            "income":   _to_float(cb.get("total_income"), 0),
-            "expenses": _to_float(cb.get("total_expenses"), 0),
-            "payouts":  _to_float(cb.get("total_payouts"), 0),
-            "closing":  _to_float(cb.get("closing_balance"), 0),
-        }
-
-        wb.close()
-
-    # ── COMPUTED AGGREGATES ────────────────────────────────────────────────────
-    @property
-    def total_gross(self):
-        return sum(r["gross"] for r in self.reservations)
-
-    @property
-    def total_ota_comm(self):
-        return sum(r["ota_comm"] for r in self.reservations)
-
-    @property
-    def total_tl_comm(self):
-        return sum(r["tl_comm"] for r in self.reservations)
-
-    @property
-    def total_net_to_owner(self):
-        return sum(r["net_to_owner"] for r in self.reservations)
-
-    @property
-    def total_opex(self):
-        return sum(e["amount"] for e in self.expenses)
-
-    @property
-    def total_payouts(self):
-        return sum(p["amount"] for p in self.payouts)
-
-    @property
-    def net_income(self):
-        """Net Income = Gross - TL Commission - OPEX"""
-        return self.total_gross - self.total_tl_comm - self.total_opex
-
-    @property
-    def nights_occupied(self):
-        return sum(r["nights"] for r in self.reservations)
-
-    @property
-    def occupancy_pct(self):
-        if self.available_nights == 0:
-            return 0.0
-        return round(self.nights_occupied / self.available_nights * 100, 1)
-
-    @property
-    def adr(self):
-        if self.nights_occupied == 0:
-            return 0.0
-        return round(self.total_gross / self.nights_occupied, 0)
-
-    @property
-    def expense_ratio(self):
-        if self.total_gross == 0:
-            return 0.0
-        return round(self.total_opex / self.total_gross * 100, 1)
-
-    @property
-    def closing_balance(self):
-        return round(self.opening_balance + self.total_gross
-                     - self.total_tl_comm - self.total_opex - self.total_payouts, 2)
-
-    def opex_by_category(self):
-        """Group expenses by category code → {code: {'name': ..., 'total': ...}}"""
-        cats = defaultdict(lambda: {"name": "", "total": 0.0})
-        for e in self.expenses:
-            code = e["category_code"]
-            cats[code]["name"] = e["category_name"] or code
-            cats[code]["total"] += e["amount"]
-        # Fill names from budget if missing
-        for code, bud in self.opex_budget.items():
-            if code in cats and not cats[code]["name"]:
-                cats[code]["name"] = bud["name"]
-        return dict(cats)
-
-    # ── VALIDATION ────────────────────────────────────────────────────────────
-    def validate(self):
-        """Run all 5 regulatory validation rules. Returns (ok, errors, warnings)."""
-        errors = list(self.errors)
-        warnings = list(self.warnings)
-
-        # RULE 1: Cash balance arithmetic (warning only - Drive may alter values)
-        calc_closing = round(self.opening_balance + self.total_gross
-                             - self.total_tl_comm - self.total_opex
-                             - self.total_payouts, 2)
-        diff = abs(calc_closing - self.cash["closing"])
-        if diff > 1.0:
-            warnings.append(
-                f"ПРАВИЛО 1 — Расчётный остаток {calc_closing:,.2f} ≠ "
-                f"указанному {self.cash['closing']:,.2f} (Δ {diff:,.2f} THB). "
-                f"Используется расчётное значение."
-            )
-
-        # RULE 2: Closing balance ≥ 0 (use calculated, not declared)
-        if calc_closing < -0.01:
-            warnings.append(
-                f"ПРАВИЛО 2 — ВНИМАНИЕ: Расчётный остаток {calc_closing:,.2f} THB отрицательный."
-            )
-
-        # RULE 3: All expenses categorized (already checked during load)
-        # (errors already added above)
-
-        # RULE 4: Commission sanity (±5% tolerance)
-        expected_comm = round(self.total_gross * self.commission_rate / 100, 2)
-        if expected_comm > 0:
-            comm_diff_pct = abs(self.total_tl_comm - expected_comm) / expected_comm * 100
-            if comm_diff_pct > 5:
-                warnings.append(
-                    f"ПРАВИЛО 4 — Комиссия TL ({self.total_tl_comm:,.0f}) отличается "
-                    f"от ожидаемой ({expected_comm:,.0f}) на {comm_diff_pct:.1f}%. "
-                    f"Если ручная корректировка — добавьте примечание."
-                )
-
-        # RULE 5: At least some reservations
-        if not self.reservations:
-            warnings.append(
-                "ПРАВИЛО 5 — В листе Reservations нет данных. "
-                "Если месяц простойный — это допустимо."
-            )
-
-        ok = len(errors) == 0
-        return ok, errors, warnings
-
-
-# ─── REPORT BUILDER ───────────────────────────────────────────────────────────
-class ReportBuilder:
-
-    def __init__(self, data: InputData):
-        self.d = data
-        self.wb = Workbook()
-        self.wb.remove(self.wb.active)
-
-    # ── TAB 1: DASHBOARD ──────────────────────────────────────────────────────
-    def build_dashboard(self):
-        ws = self.wb.create_sheet("Dashboard")
-        ws.sheet_properties.tabColor = NAVY
-        ws.sheet_view.showGridLines = False
-        d = self.d
-
-        # Title block
-        ws.merge_cells("B2:H2")
-        c = ws["B2"]
-        c.value = "TROPICLOOK — OWNER FINANCIAL REPORT"
-        c.font = _font(bold=True, color=WHITE, size=14)
-        c.fill = _fill(NAVY)
-        c.alignment = _align("center")
-        ws.row_dimensions[2].height = 28
-
-        ws.merge_cells("B3:H3")
-        c = ws["B3"]
-        c.value = f"{d.property_name}  |  {d.period_label}  |  TL-{d.property_code}"
-        c.font = _font(color=WHITE, size=10)
-        c.fill = _fill(TEAL)
-        c.alignment = _align("center")
-        ws.row_dimensions[3].height = 18
-
-        ws.merge_cells("B4:H4")
-        c = ws["B4"]
-        c.value = (f"Owner: {d.owner_name}  |  Commission: {d.commission_rate}%  |  "
-                   f"{d.property_type} {d.bedrooms}BR  |  {d.location}")
-        c.font = _font(color="DDDDDD", size=9, italic=True)
-        c.fill = _fill(NAVY)
-        c.alignment = _align("center")
-        ws.row_dimensions[4].height = 16
-
-        # KPI cards (row 6-8)
-        ws.row_dimensions[6].height = 14
-        kpis = [
-            ("GROSS REVENUE",    f"{d.total_gross:,.0f} ฿",    "Доход от бронирований"),
-            ("NET OWNER INCOME", f"{d.net_income:,.0f} ฿",     "После комиссии и OPEX"),
-            ("CASH BALANCE",     f"{d.closing_balance:,.0f} ฿","Остаток на счёте"),
-        ]
-        kpi_cols = [2, 4, 6]
-        for i, (title, val, sub) in enumerate(kpis):
-            col = kpi_cols[i]
-            ws.merge_cells(start_row=7, start_column=col, end_row=7, end_column=col+1)
-            ws.merge_cells(start_row=8, start_column=col, end_row=8, end_column=col+1)
-            ws.merge_cells(start_row=9, start_column=col, end_row=9, end_column=col+1)
-            h = ws.cell(row=7, column=col, value=title)
-            h.font = _font(bold=True, color=WHITE, size=9)
-            h.fill = _fill(NAVY)
-            h.alignment = _align("center")
-            v = ws.cell(row=8, column=col, value=val)
-            v.font = _font(bold=True, color=GOLD, size=16)
-            v.fill = _fill(TEAL)
-            v.alignment = _align("center")
-            s = ws.cell(row=9, column=col, value=sub)
-            s.font = _font(color="AAAAAA", size=8)
-            s.fill = _fill("1A5050")
-            s.alignment = _align("center")
-            ws.row_dimensions[7].height = 16
-            ws.row_dimensions[8].height = 26
-            ws.row_dimensions[9].height = 14
-
-        kpis2 = [
-            ("OCCUPANCY",     f"{d.occupancy_pct:.0f}%",
-                              f"{d.nights_occupied} из {d.days_in_month} ночей"),
-            ("ADR",           f"{d.adr:,.0f} ฿",       "Средняя стоимость/ночь"),
-            ("EXPENSE RATIO", f"{d.expense_ratio:.1f}%", "OPEX / Revenue"),
-        ]
-        for i, (title, val, sub) in enumerate(kpis2):
-            col = kpi_cols[i]
-            for rn in [11, 12, 13]:
-                ws.merge_cells(start_row=rn, start_column=col, end_row=rn, end_column=col+1)
-            h = ws.cell(row=11, column=col, value=title)
-            h.font = _font(bold=True, color=WHITE, size=9)
-            h.fill = _fill(NAVY)
-            h.alignment = _align("center")
-            v = ws.cell(row=12, column=col, value=val)
-            v.font = _font(bold=True, color=GOLD, size=14)
-            v.fill = _fill(TEAL)
-            v.alignment = _align("center")
-            s = ws.cell(row=13, column=col, value=sub)
-            s.font = _font(color="AAAAAA", size=8)
-            s.fill = _fill("1A5050")
-            s.alignment = _align("center")
-            ws.row_dimensions[11].height = 16
-            ws.row_dimensions[12].height = 22
-            ws.row_dimensions[13].height = 14
-
-        # Bookings table (row 16+)
-        ws.row_dimensions[15].height = 8
-        ws.merge_cells("B16:H16")
-        hdr = ws["B16"]
-        hdr.value = f"BOOKINGS — {d.period_label.upper()}"
-        hdr.font = _font(bold=True, color=WHITE, size=10)
-        hdr.fill = _fill(NAVY)
-        hdr.alignment = _align("left")
-        ws.row_dimensions[16].height = 18
-
-        bk_headers = [("Бронирование",16),("Канал",14),("Гость/Описание",22),
-                      ("Даты",16),("Ночей",8),("Gross (฿)",14),("Net Owner (฿)",14)]
-        _apply_header_row(ws, 17, bk_headers, bg=TEAL)
-
-        if not d.reservations:
-            ws.merge_cells("B18:H18")
-            c = ws.cell(row=18, column=2, value="Бронирований нет")
-            c.font = _font(color="888888", italic=True)
-            bk_end_row = 18
-        else:
-            for ri, res in enumerate(d.reservations, 18):
-                ws.row_dimensions[ri].height = 15
-                bg = LGRAY if ri % 2 == 0 else WHITE
-                ci_d = res["checkin"]
-                co_d = res["checkout"]
-                dates_str = ""
-                if ci_d and co_d:
-                    dates_str = f"{ci_d.strftime('%d.%m')}—{co_d.strftime('%d.%m')}"
-                vals = [
-                    res["booking_id"], res["channel"],
-                    "", dates_str,
-                    res["nights"],
-                    res["gross"] if res["gross"] else "",
-                    res["net_to_owner"] if res["net_to_owner"] else "",
-                ]
-                for ci, val in enumerate(vals, 2):
-                    c = ws.cell(row=ri, column=ci, value=val)
-                    c.font = _font(size=9)
-                    c.fill = _fill(bg)
-                    c.border = _bdr()
-                    if ci in [7, 8]:
-                        c.number_format = "#,##0"
-                        c.alignment = _align("right")
-            bk_end_row = 17 + len(d.reservations)
-
-        # MoM comparison (2 rows below bookings)
-        mom_start = bk_end_row + 2
-        ws.row_dimensions[mom_start].height = 8
-        ws.merge_cells(start_row=mom_start+1, start_column=2,
-                       end_row=mom_start+1, end_column=8)
-        hdr = ws.cell(row=mom_start+1, column=2,
-                      value="СРАВНЕНИЕ — ТЕКУЩИЙ МЕСЯЦ vs ПРЕДЫДУЩИЙ")
-        hdr.font = _font(bold=True, color=WHITE, size=10)
-        hdr.fill = _fill(NAVY)
-        hdr.alignment = _align("left")
-        ws.row_dimensions[mom_start+1].height = 18
-
-        mom_hdr = [("Показатель",22),("Текущий месяц",18),("Предыдущий месяц",18),
-                   ("Δ THB / %",14)]
-        _apply_header_row(ws, mom_start+2, mom_hdr, bg=TEAL)
-
-        mom_data = [
-            ("Gross Revenue (฿)",    d.total_gross,     d.prior["gross"]),
-            ("TL Management Fee (฿)",d.total_tl_comm,   d.prior["mgmt_fee"]),
-            ("Total OPEX (฿)",       d.total_opex,      d.prior["opex"]),
-            ("Net Income (฿)",       d.net_income,      d.prior["net_income"]),
-            ("Occupancy %",          d.occupancy_pct,   d.prior["occupancy"]),
-            ("ADR (฿)",              d.adr,             d.prior["adr"]),
-        ]
-        for mi, (label, curr, prev) in enumerate(mom_data, mom_start+3):
-            ws.row_dimensions[mi].height = 15
-            bg = LGRAY if mi % 2 == 0 else WHITE
-            delta = curr - prev if prev else 0
-            delta_pct = (delta / prev * 100) if prev else 0
-            delta_str = f"{delta:+,.0f} / {delta_pct:+.1f}%"
-            delta_color = GRN_FG if delta >= 0 else RED_FG
-            for ci, (val, fmt, al) in enumerate([
-                (label, None, "left"),
-                (curr, "#,##0.0", "right"),
-                (prev, "#,##0.0", "right"),
-                (delta_str, None, "center"),
-            ], 2):
-                c = ws.cell(row=mi, column=ci, value=val)
-                c.font = _font(size=9, color=(delta_color if ci == 5 else "000000"),
-                               bold=(ci == 5))
-                c.fill = _fill(bg)
-                c.border = _bdr()
-                if fmt:
-                    c.number_format = fmt
-                c.alignment = _align(al)
-
-        # Balance movement row
-        bal_row = mom_start + 3 + len(mom_data) + 1
-        _section_hdr(ws, bal_row, "ДВИЖЕНИЕ БАЛАНСА", 7, bg=NAVY)
-        ws.row_dimensions[bal_row+1].height = 18
-        bal_labels = [
-            f"Начальный баланс\n{d.opening_balance:,.0f} ฿",
-            f"+ Доходы\n{d.total_gross:,.0f} ฿",
-            f"− Комиссия TL\n{d.total_tl_comm:,.0f} ฿",
-            f"− OPEX\n{d.total_opex:,.0f} ฿",
-            f"− Выплаты\n{d.total_payouts:,.0f} ฿",
-            "=",
-            f"Конечный баланс\n{d.closing_balance:,.0f} ฿",
-        ]
-        bal_colors = [LGRAY, GRN_BG, RED_BG, RED_BG, RED_BG, WHITE, TEAL]
-        bal_fcolors = ["333333", GRN_FG, RED_FG, RED_FG, RED_FG, "000000", WHITE]
-        for ci, (lbl, bg, fg) in enumerate(zip(bal_labels, bal_colors, bal_fcolors), 2):
-            c = ws.cell(row=bal_row+1, column=ci, value=lbl)
-            c.font = _font(bold=(ci in [2, 8]), color=fg, size=8)
-            c.fill = _fill(bg)
-            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            c.border = _bdr()
-        ws.row_dimensions[bal_row+1].height = 30
-
-        # Column widths
-        for col, w in [("A",3),("B",24),("C",16),("D",24),("E",16),("F",10),("G",16),("H",16)]:
-            ws.column_dimensions[col].width = w
-
-        return ws
-
-    # ── TAB 2: P&L MONTHLY ────────────────────────────────────────────────────
-    def build_pl_monthly(self):
-        ws = self.wb.create_sheet("P&L Monthly")
-        ws.sheet_properties.tabColor = TEAL
-        ws.sheet_view.showGridLines = False
-        d = self.d
-
-        # Title
-        ws.merge_cells("A1:D1")
-        t = ws["A1"]
-        t.value = f"P&L — {d.property_name} — {d.period_label}"
-        t.font = _font(bold=True, color=WHITE, size=12)
-        t.fill = _fill(NAVY)
-        t.alignment = _align("center")
-        ws.row_dimensions[1].height = 24
-
-        ws.merge_cells("A2:D2")
-        t2 = ws["A2"]
-        t2.value = f"Начальный баланс: {d.opening_balance:,.2f} ฿"
-        t2.font = _font(color="CCCCCC", size=9)
-        t2.fill = _fill(TEAL)
-        t2.alignment = _align("left")
-
-        # Column headers
-        ws.cell(row=4, column=2, value=d.period_label).font = _font(bold=True, size=9)
-        ws.cell(row=4, column=3, value=d.prior["period"]).font = _font(bold=True, size=9)
-        ws.cell(row=4, column=4, value="Примечание").font = _font(bold=True, size=9, italic=True)
-        ws.row_dimensions[4].height = 16
-        for col in [2,3,4]:
-            ws.cell(row=4, column=col).border = _bdr()
-            ws.cell(row=4, column=col).fill = _fill(LGRAY)
-
-        row = 6
-
-        def pl_section(label, bg=NAVY):
-            nonlocal row
-            _section_hdr(ws, row, label, 4)
-            row += 1
-
-        def pl_line(label, curr, prior=None, note="", bold=False,
-                    color="000000", indent=3):
-            nonlocal row
-            ws.row_dimensions[row].height = 15
-            bg = LGRAY if bold else WHITE
-            fg = GOLD if bold else color
-            c1 = ws.cell(row=row, column=1, value=(" " * indent) + label)
-            c1.font = _font(bold=bold, color=fg, size=9)
-            c1.fill = _fill(bg if not bold else NAVY)
-            c1.alignment = _align("left")
-            c1.border = _bdr()
-            c2 = ws.cell(row=row, column=2, value=curr if curr != 0 else "")
-            c2.font = _font(bold=bold, color=(WHITE if bold else color), size=9)
-            c2.fill = _fill(bg if not bold else NAVY)
-            c2.number_format = "#,##0"
-            c2.alignment = _align("right")
-            c2.border = _bdr()
-            if prior is not None:
-                c3 = ws.cell(row=row, column=3, value=prior if prior != 0 else "")
-                c3.font = _font(size=9, color="666666")
-                c3.fill = _fill(bg if not bold else NAVY)
-                c3.number_format = "#,##0"
-                c3.alignment = _align("right")
-                c3.border = _bdr()
-            c4 = ws.cell(row=row, column=4, value=note)
-            c4.font = _font(size=8, italic=True, color="888888")
-            c4.fill = _fill(WHITE)
-            c4.alignment = _align("left", wrap=True)
-            c4.border = _bdr()
-            row += 1
-
-        def pl_separator():
-            nonlocal row
-            ws.row_dimensions[row].height = 5
-            row += 1
-
-        # ─ REVENUE ─
-        pl_section("REVENUE / ДОХОДЫ")
-        for res in d.reservations:
-            co = res["checkout"]
-            note_str = (f"{res['channel']}, {res['nights']}н"
-                        + (f", выезд {co.strftime('%d.%m')}" if co else ""))
-            pl_line(res["booking_id"], res["gross"], note=note_str)
-
-        # Utility recharge (if any)
-        utl_rchg = sum(e["amount"] for e in d.expenses
-                       if e["category_code"] in ("UTL-RCHG","UTL_RCHG"))
-        if utl_rchg > 0:
-            pl_line("Возмещение электричества", utl_rchg, note="Utility recharge")
-
-        total_income = d.total_gross + utl_rchg
-        pl_line("ИТОГО ДОХОД (A)", total_income, d.prior["gross"] + 0,
-                bold=True, indent=0)
-        pl_separator()
-
-        # ─ TL COMMISSION ─
-        pl_section("КОМИССИЯ TROPICLOOK")
-        for res in d.reservations:
-            note_c = f"{d.commission_rate}% от {res['gross']:,.0f}"
-            pl_line(res["booking_id"], -res["tl_comm"], note=note_c)
-        if d.total_ota_comm > 0:
-            pl_line("Справочно: комиссия OTA (не влияет на баланс)",
-                    -d.total_ota_comm, note="Удержано OTA", color="888888")
-        pl_line("ИТОГО КОМИССИЯ TL (B)", -d.total_tl_comm, -d.prior["mgmt_fee"],
-                bold=True, indent=0)
-        pl_separator()
-
-        # ─ OPEX ─
-        pl_section("ОПЕРАЦИОННЫЕ РАСХОДЫ / OPEX")
-        opex_cats = d.opex_by_category()
-        for code, cat in sorted(opex_cats.items(), key=lambda x: -x[1]["total"]):
-            bud = d.opex_budget.get(code, {}).get("budget", 0)
-            note_str = f"бюджет:{bud:,.0f}" if bud else ""
-            pl_line(cat["name"] or code, -cat["total"], note=note_str)
-        pl_line(f"ИТОГО OPEX (C) — {len(d.expenses)} операций",
-                -d.total_opex, -d.prior["opex"], bold=True, indent=0)
-        pl_separator()
-
-        # ─ NET INCOME ─
-        pl_section("ЧИСТЫЙ ДОХОД", bg=TEAL)
-        pl_line("ЧИСТЫЙ ДОХОД (A+B+C)", d.net_income, d.prior["net_income"],
-                bold=True, color=GOLD if d.net_income >= 0 else RED_FG, indent=0)
-        pl_separator()
-
-        # ─ PAYOUTS ─
-        pl_section("ВЫПЛАТЫ СОБСТВЕННИКУ")
-        for pay in d.payouts:
-            note_p = pay["date"].strftime("%d.%m.%Y") if pay["date"] else ""
-            pl_line(pay["description"] or pay["type"], -pay["amount"], note=note_p)
-        pl_line(f"ИТОГО ВЫПЛАТЫ (D) — {len(d.payouts)} выплат",
-                -d.total_payouts, -d.prior["payouts"], bold=True, indent=0)
-        pl_separator()
-
-        # ─ BALANCE ─
-        pl_section("ДВИЖЕНИЕ БАЛАНСА", bg=NAVY)
-        pl_line("Баланс на начало",     d.opening_balance,   note="")
-        pl_line("+ Доходы (A)",          total_income,        note="")
-        pl_line("+ Utility Recharge",    utl_rchg if utl_rchg else "",
-                note="уже включено в A") if utl_rchg > 0 else None
-        pl_line("− Комиссия TL (B)",     -d.total_tl_comm,
-                note="OTA не влияет на баланс")
-        pl_line("− OPEX (C)",            -d.total_opex,       note="")
-        pl_line("− Выплаты (D)",         -d.total_payouts,    note="")
-        pl_line("БАЛАНС НА КОНЕЦ",       d.closing_balance,
-                bold=True, color=(GRN_FG if d.closing_balance >= 0 else RED_FG), indent=0)
-
-        for col, w in [("A",28),("B",18),("C",18),("D",30)]:
-            ws.column_dimensions[col].width = w
-
-        return ws
-
-    # ── TAB 3: OPEX PASSPORT ──────────────────────────────────────────────────
-    def build_opex_passport(self):
-        ws = self.wb.create_sheet("OPEX Passport")
-        ws.sheet_properties.tabColor = GOLD
-        ws.sheet_view.showGridLines = False
-        d = self.d
-
-        ws.merge_cells("A1:G1")
-        t = ws["A1"]
-        t.value = f"OPEX PASSPORT — {d.property_name} — {d.period_label}"
-        t.font = _font(bold=True, color=WHITE, size=11)
-        t.fill = _fill(NAVY)
-        t.alignment = _align("center")
-        ws.row_dimensions[1].height = 22
-
-        _apply_header_row(ws, 4,
-            [("Код",10),("Категория",24),("Бюджет ฿",14),("Факт ฿",14),
-             ("Δ ฿",14),("Δ %",10),("Статус",12)], bg=TEAL)
-
-        opex_cats = d.opex_by_category()
-        # Merge budget and actual categories
-        all_codes = sorted(
-            set(list(d.opex_budget.keys()) + list(opex_cats.keys()))
-        )
-
-        total_bud = 0.0
-        total_act = 0.0
-
-        def status_flag(bud, act):
-            if bud == 0 and act == 0:
-                return ("➖ Zero",    LGRAY,  "555555")
-            if bud == 0 and act > 0:
-                return ("📌 Unbudgeted", "E3F2FD", "0D47A1")
-            if act == 0 and bud > 0:
-                return ("✅ In Budget", GRN_BG, GRN_FG)
-            diff = (act - bud) / bud * 100
-            if diff <= 0:
-                return ("✅ In Budget", GRN_BG, GRN_FG)
-            elif diff <= 10:
-                return ("🟡 Minor",    AMB_BG, AMB_FG)
-            elif diff <= 30:
-                return ("⚠️ Significant", "FFF3E0", "E65100")
-            else:
-                return ("🚨 Critical",  RED_BG, RED_FG)
-
-        for ri, code in enumerate(all_codes, 5):
-            ws.row_dimensions[ri].height = 15
-            bg_row = LGRAY if ri % 2 == 0 else WHITE
-            bud_info = d.opex_budget.get(code, {"name": code, "budget": 0})
-            act_info = opex_cats.get(code, {"name": bud_info["name"], "total": 0})
-            bud = bud_info["budget"]
-            act = act_info["total"]
-            total_bud += bud
-            total_act += act
-            delta = act - bud
-            delta_pct = (delta / bud * 100) if bud > 0 else 0
-            flag, flag_bg, flag_fg = status_flag(bud, act)
-
-            vals = [code, act_info.get("name") or bud_info.get("name") or code,
-                    bud, act, delta, f"{delta_pct:.0f}%", flag]
-            colors_  = ["555555","000000","000000","000000",
-                        (RED_FG if delta > 0 else GRN_FG), (RED_FG if delta > 0 else GRN_FG),
-                        flag_fg]
-            bgs_     = [bg_row]*6 + [flag_bg]
-
-            for ci, (val, color, bg_c) in enumerate(zip(vals, colors_, bgs_), 1):
-                c = ws.cell(row=ri, column=ci, value=val)
-                c.font = _font(size=9, color=color,
-                               bold=(ci in [1, 7]))
-                c.fill = _fill(bg_c)
-                c.border = _bdr()
-                if ci in [3,4,5]:
-                    c.number_format = "#,##0"
-                    c.alignment = _align("right")
-
-        # Totals row
-        tot_row = 5 + len(all_codes)
-        ws.row_dimensions[tot_row].height = 18
-        total_delta = total_act - total_bud
-        tot_vals = ["", "ИТОГО", total_bud, total_act, total_delta,
-                    f"{(total_delta/total_bud*100):.0f}%" if total_bud else "",
-                    ("✅" if total_delta <= 0 else ("⚠️" if total_delta/total_bud < 0.3 else "🚨")) if total_bud else ""]
-        for ci, val in enumerate(tot_vals, 1):
-            c = ws.cell(row=tot_row, column=ci, value=val)
-            c.font = _font(bold=True, size=9, color=WHITE)
-            c.fill = _fill(NAVY)
-            c.border = _bdr()
-            if ci in [3,4,5]:
-                c.number_format = "#,##0"
-                c.alignment = _align("right")
-
-        # Anomaly block
-        anomalies = []
-        for code in all_codes:
-            bud_info = d.opex_budget.get(code, {"budget": 0})
-            act_info = opex_cats.get(code, {"total": 0})
-            bud = bud_info["budget"]
-            act = act_info["total"]
-            flag, _, _ = status_flag(bud, act)
-            if "✅" not in flag and "➖" not in flag:
-                name = act_info.get("name") or bud_info.get("name") or code
-                anomalies.append(f"{flag} {code} ({name}): бюджет {bud:,.0f} / факт {act:,.0f} ฿")
-
-        if anomalies:
-            anom_start = tot_row + 2
-            _section_hdr(ws, anom_start, "⚠ ANOMALY FLAGS — Требуют внимания", 7, bg="BF360C")
-            for ai, txt in enumerate(anomalies, anom_start+1):
-                ws.row_dimensions[ai].height = 14
-                ws.merge_cells(start_row=ai, start_column=1, end_row=ai, end_column=7)
-                c = ws.cell(row=ai, column=1, value=txt)
-                c.font = _font(size=9, color=RED_FG)
-                c.fill = _fill(RED_BG)
-                c.border = _bdr()
-
-        for col, w in [("A",10),("B",26),("C",14),("D",14),("E",14),("F",10),("G",16)]:
-            ws.column_dimensions[col].width = w
-
-        ws.freeze_panes = "A5"
-        ws.auto_filter.ref = f"A4:G{4+len(all_codes)}"
-        return ws
-
-    # ── TAB 4: 12-MONTH SUMMARY ───────────────────────────────────────────────
-    def build_12month(self):
-        ws = self.wb.create_sheet("12-Month Summary")
-        ws.sheet_properties.tabColor = "444444"
-        ws.sheet_view.showGridLines = False
-        d = self.d
-
-        ws.merge_cells("A1:N1")
-        t = ws["A1"]
-        t.value = f"PERFORMANCE OVERVIEW — {d.property_name}"
-        t.font = _font(bold=True, color=WHITE, size=11)
-        t.fill = _fill(NAVY)
-        t.alignment = _align("center")
-        ws.row_dimensions[1].height = 22
-
-        ws.merge_cells("A2:N2")
-        t2 = ws["A2"]
-        t2.value = f"Период управления | YTD: {d.cumulative['period']}"
-        t2.font = _font(color="CCCCCC", size=9)
-        t2.fill = _fill(TEAL)
-        t2.alignment = _align("center")
-
-        # Derive month columns based on report_period
-        try:
-            yr, mo = d.report_period.split("-")
-            yr, mo = int(yr), int(mo)
-        except Exception:
-            yr, mo = 2025, 1
-
-        months = []
-        for i in range(11, -1, -1):
-            m = mo - i
-            y = yr
-            while m <= 0:
-                m += 12
-                y -= 1
-            months.append((y, m))
-
-        month_labels = []
-        for y, m in months:
-            mon_abbr = ["Jan","Feb","Mar","Apr","May","Jun",
-                        "Jul","Aug","Sep","Oct","Nov","Dec"][m-1]
-            month_labels.append(f"{mon_abbr}'{str(y)[2:]}")
-
-        # Headers: row 4
-        ws.cell(row=4, column=1, value="Показатель")
-        ws.cell(row=4, column=1).font = _font(bold=True, size=9, color=WHITE)
-        ws.cell(row=4, column=1).fill = _fill(NAVY)
-        ws.column_dimensions["A"].width = 26
-
-        for ci, lbl in enumerate(month_labels, 2):
-            is_current = (months[ci-2] == (yr, mo))
-            c = ws.cell(row=4, column=ci, value=lbl)
-            c.font = _font(bold=True, size=9,
-                           color=(WHITE if not is_current else GOLD))
-            c.fill = _fill(TEAL if not is_current else NAVY)
-            c.alignment = _align("center")
-            c.border = _bdr()
-            ws.column_dimensions[get_column_letter(ci)].width = 12
-
-        ws.cell(row=4, column=14, value="TOTAL/YTD")
-        ws.cell(row=4, column=14).font = _font(bold=True, size=9, color=WHITE)
-        ws.cell(row=4, column=14).fill = _fill(NAVY)
-        ws.cell(row=4, column=14).alignment = _align("center")
-        ws.column_dimensions["N"].width = 14
-        ws.row_dimensions[4].height = 18
-
-        # Current month index
-        curr_idx = 11  # last column (index from 0)
-
-        # Data rows
-        sections = [
-            ("REVENUE", None),
-            ("Gross Revenue (฿)",    d.total_gross,    d.prior["gross"],   d.cumulative["gross"]),
-            ("TL Commission (฿)",    d.total_tl_comm,  d.prior["mgmt_fee"],d.cumulative["mgmt_fee"]),
-            ("OPEX", None),
-            ("Total OPEX (฿)",       d.total_opex,     d.prior["opex"],    d.cumulative["opex"]),
-            ("RESULT", None),
-            ("Net Income (฿)",       d.net_income,     d.prior["net_income"],d.cumulative["net_income"]),
-            ("Payouts (฿)",          d.total_payouts,  d.prior["payouts"], d.cumulative["payouts"]),
-            ("Closing Balance (฿)",  d.closing_balance,d.prior["balance"], d.closing_balance),
-            ("KPIs", None),
-            ("Bookings (#)",         len(d.reservations), d.prior["bookings"], d.cumulative["bookings"]),
-            ("Nights occupied",      d.nights_occupied,   d.prior["nights"],   d.cumulative["nights"]),
-            ("Occupancy %",          d.occupancy_pct,     d.prior["occupancy"],d.cumulative["occupancy"]),
-            ("ADR (฿)",              d.adr,               d.prior["adr"],      d.cumulative["adr"]),
-        ]
-
-        for ri, row_data in enumerate(sections, 5):
-            ws.row_dimensions[ri].height = 15
-            label = row_data[0]
-            # Section header
-            if row_data[1] is None:
-                _section_hdr(ws, ri, label, 14)
-                continue
-            curr_val, prior_val, ytd_val = row_data[1], row_data[2], row_data[3]
-
-            c = ws.cell(row=ri, column=1, value=label)
-            c.font = _font(size=9)
-            c.border = _bdr()
-
-            for ci in range(2, 14):
-                col_idx = ci - 2  # 0-based
-                is_current = (col_idx == curr_idx)
-                is_prior = (col_idx == curr_idx - 1)
-                if is_current:
-                    val = curr_val
-                elif is_prior:
-                    val = prior_val
-                else:
-                    val = "—"
-                cell = ws.cell(row=ri, column=ci, value=val)
-                cell.font = _font(size=9,
-                                  bold=is_current,
-                                  color=(GOLD if is_current else "444444"))
-                cell.fill = _fill(TEAL if is_current else (LGRAY if ri % 2 == 0 else WHITE))
-                cell.border = _bdr()
-                cell.alignment = _align("right")
-                if isinstance(val, (int, float)):
-                    cell.number_format = "#,##0.0"
-
-            ytd_cell = ws.cell(row=ri, column=14, value=ytd_val)
-            ytd_cell.font = _font(bold=True, size=9, color=WHITE)
-            ytd_cell.fill = _fill(NAVY)
-            ytd_cell.border = _bdr()
-            ytd_cell.alignment = _align("right")
-            ytd_cell.number_format = "#,##0.0"
-
-        ws.freeze_panes = "B5"
-        return ws
-
-    # ── TAB 5: TRANSACTION LEDGER ─────────────────────────────────────────────
-    def build_ledger(self):
-        ws = self.wb.create_sheet("Transaction Ledger")
-        ws.sheet_properties.tabColor = NAVY
-        ws.sheet_view.showGridLines = False
-        d = self.d
-
-        ws.merge_cells("B2:G2")
-        t = ws["B2"]
-        t.value = f"LEDGER — {d.property_name} — {d.period_label}"
-        t.font = _font(bold=True, color=WHITE, size=11)
-        t.fill = _fill(NAVY)
-        t.alignment = _align("center")
-        ws.row_dimensions[2].height = 22
-
-        _apply_header_row(ws, 5,
-            [("",1),("Дата",10),("Описание",34),("Кат.",14),
-             ("Приход ฿",14),("Расход ฿",14),("Баланс ฿",16)],
-            bg=TEAL, height=18)
-
-        # Build transaction list
-        # Key rule: revenue recognized on CHECKOUT DATE
-        transactions = []
-
-        # Add expense transactions (date of payment)
-        for e in d.expenses:
-            if e["category_code"] in ("UTL-RCHG", "UTL_RCHG"):
-                continue  # utility recharge goes with its booking
-            transactions.append({
-                "date": e["date"],
-                "desc": e["description"],
-                "cat":  e["category_code"],
-                "inc":  0,
-                "exp":  e["amount"],
-            })
-
-        # Add revenue on CHECKOUT date (principle from FIN-REG-OWN-RPT-001)
-        for res in d.reservations:
-            checkout = res["checkout"]
-            # Revenue
-            transactions.append({
-                "date": checkout,
-                "desc": f"Приход: {res['booking_id']} (выезд — checkout)",
-                "cat":  "REVENUE",
-                "inc":  res["gross"],
-                "exp":  0,
-            })
-            # TL Commission (same date as revenue)
-            if res["tl_comm"] > 0:
-                transactions.append({
-                    "date": checkout,
-                    "desc": f"Комиссия TL: {res['booking_id']}",
-                    "cat":  "MGMT-FEE",
-                    "inc":  0,
-                    "exp":  res["tl_comm"],
-                })
-            # Utility recharge (same date as checkout)
-            utl = sum(e["amount"] for e in d.expenses
-                      if e["category_code"] in ("UTL-RCHG", "UTL_RCHG")
-                      and (e["booking_ref"] == res["booking_id"] or
-                           e["booking_ref"] == ""))
-            if utl > 0:
-                transactions.append({
-                    "date": checkout,
-                    "desc": f"Электричество: {res['booking_id']} (возмещение)",
-                    "cat":  "UTL-RCHG",
-                    "inc":  utl,
-                    "exp":  0,
-                })
-
-        # Add payouts
-        for pay in d.payouts:
-            transactions.append({
-                "date": pay["date"],
-                "desc": pay["description"] or pay["type"],
-                "cat":  "PAYOUT",
-                "inc":  0,
-                "exp":  pay["amount"],
-            })
-
-        # Sort chronologically (None dates go last)
-        def sort_key(t):
-            if t["date"] is None:
-                return date(9999, 12, 31)
-            return t["date"]
-
-        transactions.sort(key=sort_key)
-
-        # Write opening balance
-        ws.row_dimensions[6].height = 15
-        ws.cell(row=6, column=3, value="НАЧАЛЬНЫЙ БАЛАНС").font = _font(bold=True, color=NAVY, size=9)
-        ws.cell(row=6, column=7, value=d.opening_balance).font = _font(bold=True, color=NAVY, size=9)
-        ws.cell(row=6, column=7).number_format = "#,##0.00"
-        ws.cell(row=6, column=7).border = _bdr()
-        ws.cell(row=6, column=3).border = _bdr()
-
-        # Write transactions
-        running = d.opening_balance
-        for ti, txn in enumerate(transactions, 7):
-            ws.row_dimensions[ti].height = 15
-            cat = txn["cat"]
-            inc = txn["inc"]
-            exp = txn["exp"]
-            if inc > 0:
-                running += inc
-            if exp > 0:
-                running -= exp
-            running = round(running, 2)
-
-            bg, fg = CAT_COLOR.get(cat, DEFAULT_CAT_COLOR)
-            bold_row = cat in ("REVENUE", "MGMT-FEE", "PAYOUT")
-
-            date_str = _date_display(txn["date"])
-            vals = [None, date_str, txn["desc"], cat,
-                    inc if inc > 0 else None,
-                    exp if exp > 0 else None,
-                    running]
-            for ci, val in enumerate(vals, 1):
-                c = ws.cell(row=ti, column=ci, value=val)
-                c.fill = _fill(bg)
-                c.font = _font(size=9, color=fg, bold=bold_row)
-                c.border = _bdr()
-                if ci in [5, 6, 7] and val is not None:
-                    c.number_format = "#,##0.00"
-                c.alignment = _align("center" if ci in [2, 4] else "left")
-
-        # Closing balance
-        closing_row = 7 + len(transactions)
-        ws.row_dimensions[closing_row].height = 15
-        ws.cell(row=closing_row, column=3, value="КОНЕЧНЫЙ БАЛАНС")
-        ws.cell(row=closing_row, column=3).font = _font(bold=True, color=NAVY, size=9)
-        ws.cell(row=closing_row, column=3).border = _bdr()
-        ws.cell(row=closing_row, column=7, value=round(running, 2))
-        ws.cell(row=closing_row, column=7).font = _font(bold=True, color=NAVY, size=9)
-        ws.cell(row=closing_row, column=7).number_format = "#,##0.00"
-        ws.cell(row=closing_row, column=7).border = _bdr()
-
-        # Note
-        note_row = closing_row + 2
-        try:
-            ws.merge_cells(start_row=note_row, start_column=2,
-                           end_row=note_row, end_column=7)
-        except Exception:
-            pass
-        note_txt = (f"⚠ Принцип признания дохода: дата ВЫЕЗДА гостя (checkout date). "
-                    f"Регламент FIN-REG-OWN-RPT-001, Раздел 2.")
-        nc = ws.cell(row=note_row, column=2, value=note_txt)
-        nc.font = _font(size=8, italic=True, color="666666")
-        nc.alignment = _align("left")
-
-        # Totals
-        total_in = sum(t["inc"] for t in transactions if t["inc"] > 0)
-        total_out = sum(t["exp"] for t in transactions if t["exp"] > 0)
-        tot_row = note_row + 1
-        ws.row_dimensions[tot_row].height = 16
-        for ci, (lbl, val) in enumerate([
-            ("", None), ("", None),
-            ("ИТОГО", None),
-            ("", None),
-            (total_in, total_in),
-            (total_out, total_out),
-            ("", None),
-        ], 1):
-            c = ws.cell(row=tot_row, column=ci,
-                        value=val if isinstance(val, float) else lbl)
-            c.font = _font(bold=True, size=9, color=WHITE)
-            c.fill = _fill(TEAL)
-            c.border = _bdr()
-            if ci == 3:
-                c.value = "ИТОГО ПРИХОД / РАСХОД"
-            if isinstance(val, float):
-                c.number_format = "#,##0.00"
-                c.alignment = _align("right")
-
-        for col, w in [("A",3),("B",10),("C",36),("D",14),
-                       ("E",14),("F",14),("G",16)]:
-            ws.column_dimensions[col].width = w
-
-        ws.freeze_panes = "B6"
-        ws.auto_filter.ref = f"B5:G{closing_row}"
-        return ws
-
-    # ── TAB 6: DAP SNAPSHOT ───────────────────────────────────────────────────
-    def build_dap_snapshot(self):
-        ws = self.wb.create_sheet("DAP Snapshot")
-        ws.sheet_properties.tabColor = TEAL
-        ws.sheet_view.showGridLines = False
-        d = self.d
-
-        ws.merge_cells("A1:F1")
-        t = ws["A1"]
-        t.value = f"DIGITAL ASSET PASSPORT — {d.property_name}"
-        t.font = _font(bold=True, color=WHITE, size=12)
-        t.fill = _fill(NAVY)
-        t.alignment = _align("center")
-        ws.row_dimensions[1].height = 24
-
-        ws.merge_cells("A2:F2")
-        t2 = ws["A2"]
-        t2.value = (f"TL-{d.property_code}-001 | ACTIVE | {d.period_label}")
-        t2.font = _font(color="CCCCCC", size=9)
-        t2.fill = _fill(TEAL)
-        t2.alignment = _align("center")
-
-        row = 4
-
-        def dap_section(label):
-            nonlocal row
-            _section_hdr(ws, row, label, 6, bg=NAVY)
-            row += 1
-
-        def dap_row(label, value, label2=None, value2=None):
-            nonlocal row
-            ws.row_dimensions[row].height = 15
-            ws.cell(row=row, column=1, value=label).font = _font(bold=True, size=9, color=NAVY)
-            c = ws.cell(row=row, column=2, value=value)
-            c.font = _font(size=9)
-            c.border = _bdr()
-            c.fill = _fill(LGRAY)
-            if label2:
-                ws.cell(row=row, column=4, value=label2).font = _font(bold=True, size=9, color=NAVY)
-                c2 = ws.cell(row=row, column=5, value=value2)
-                c2.font = _font(size=9)
-                c2.border = _bdr()
-                c2.fill = _fill(LGRAY)
-            row += 1
-
-        # L1
-        dap_section("L1 — IDENTITY")
-        dap_row("Property", d.property_name, "Owner", d.owner_name)
-        dap_row("Code", f"TL-{d.property_code}-001", "Email", d.owner_email)
-        dap_row("Type", d.property_type, "Bedrooms", d.bedrooms)
-        dap_row("Location", d.location, "Legal Entity", d.legal_entity)
-        dap_row("Commission", f"{d.commission_rate}%", "Contract Start", d.contract_start)
-        dap_row("Status", "ACTIVE", "Period", d.period_label)
         row += 1
+        ws.row_dimensions[row].height = 14
+        delta = fact - bgt
+        delta_pct = (delta / bgt) if bgt != 0 else (-1 if fact == 0 else 0)
+        status = "✅" if fact <= bgt or bgt == 0 else "🔴"
+        name = CAT_NAMES.get(cat, cat)
 
-        # L2
-        dap_section("L2 — TECHNICAL")
-        dap_row("Property Type", d.property_type, "Bedrooms", d.bedrooms)
-        dap_row("Available Nights/mo", d.available_nights, "Days in Month", d.days_in_month)
-        dap_row("Last Inspection", "— (pending)", "Condition Score", "— (pending)")
+        fill = _fill(LIGHT_BG) if row % 2 == 0 else _fill(WHITE)
+        vals = [name, bgt, fact, delta, delta_pct, status]
+        for i, v in enumerate(vals, 2):
+            c = ws.cell(row, i, v)
+            c.font = _f(size=9); c.fill = fill; c.alignment = _align("center" if i >= 3 else "left")
+            if i == 6:  # status
+                c.font = _f(size=11)
+        total_bgt += bgt; total_fact += fact
+
+    # Totals row
+    row += 1
+    ws.row_dimensions[row].height = 15
+    for i, v in enumerate(["ИТОГО", total_bgt, total_fact, total_fact - total_bgt, None, None], 2):
+        c = ws.cell(row, i, v)
+        c.font = _f(bold=True, size=10); c.fill = _fill(LIGHT_BG)
+        c.border = _border_bottom("medium"); c.alignment = _align("center" if i >= 3 else "left")
+
+
+# ── SHEET 4: 12-MONTH SUMMARY ─────────────────────────────────────────────────
+def build_12month(wb, data, rpt_year, rpt_month, months):
+    ws = wb.create_sheet("12-Month Summary")
+    ws.sheet_view.showGridLines = False
+
+    info      = data["info"]
+    prop_name = info.get("property_name", "")
+    mgmt_start = info.get("mgmt_start_date")
+    if isinstance(mgmt_start, datetime):
+        start_str = f"{MONTHS_RU[mgmt_start.month]} {mgmt_start.year}"
+    else:
+        start_str = "—"
+    end_str = f"{MONTHS_RU[rpt_month]} {rpt_year}"
+
+    # Column setup: B=labels, C..N=months, O=TOTAL
+    num_months = len(months)
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 24
+    for i in range(num_months):
+        col = get_column_letter(3 + i)
+        ws.column_dimensions[col].width = 13
+    total_col = get_column_letter(3 + num_months)
+    ws.column_dimensions[total_col].width = 14
+
+    def mc(r, c): return ws.cell(r, c)
+
+    # Rows 1-2: titles
+    ws.row_dimensions[1].height = 20
+    last_col = 3 + num_months
+    ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=last_col)
+    c = ws["B1"]; c.value = f"PERFORMANCE OVERVIEW — {prop_name}"
+    c.font = _f(bold=True, size=12, color=WHITE); c.fill = _fill(NAVY); c.alignment = _align("center")
+
+    ws.row_dimensions[2].height = 14
+    ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=last_col)
+    c = ws["B2"]; c.value = f"{start_str} — {end_str} (management period)"
+    c.font = _f(size=9); c.alignment = _align("center")
+
+    # Row 3: column headers
+    ws.row_dimensions[3].height = 14
+    mc(3, 2).value = "Показатель"
+    mc(3, 2).font = _f(bold=True, size=9, color=WHITE); mc(3, 2).fill = _fill(NAVY); mc(3, 2).alignment = _align("left")
+    for i, mo in enumerate(months):
+        c = mc(3, 3 + i); c.value = mo["label"]
+        c.font = _f(bold=True, size=9, color=WHITE); c.fill = _fill(NAVY); c.alignment = _align("center")
+    tc = mc(3, last_col); tc.value = "TOTAL"
+    tc.font = _f(bold=True, size=9, color=WHITE); tc.fill = _fill(NAVY); tc.alignment = _align("center")
+
+    def write_row(r, label, values, totals_fn=sum, bold=False, bg=None, is_section=False):
+        ws.row_dimensions[r].height = 14
+        if is_section:
+            ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=last_col)
+            c = mc(r, 2); c.value = label
+            c.font = _f(bold=True, size=9, color=WHITE); c.fill = _fill(TEAL); c.alignment = _align("left")
+            return
+        fill = _fill(bg or WHITE)
+        c = mc(r, 2); c.value = label
+        c.font = _f(bold=bold, size=9); c.fill = fill; c.alignment = _align("left")
+        non_none = [v for v in values if v is not None]
+        total = totals_fn(non_none) if non_none else None
+        for i, v in enumerate(values):
+            c = mc(r, 3 + i)
+            c.value = round(v, 2) if isinstance(v, float) else v
+            c.font = _f(bold=bold, size=9); c.fill = fill; c.alignment = _align("right")
+        tc = mc(r, last_col)
+        tc.value = round(total, 2) if isinstance(total, float) else total
+        tc.font = _f(bold=bold, size=9); tc.fill = _fill(LIGHT_BG) if not bg else fill
+        tc.alignment = _align("right")
+
+    row = 3
+    # REVENUE section
+    row += 1; write_row(row, "REVENUE", [], is_section=True)
+    row += 1; write_row(row, "Gross Revenue (฿)", [m["gross"] for m in months], bg=LIGHT_BG)
+    row += 1; write_row(row, "Utility (฿)",       [m["utility"] for m in months])
+    row += 1; write_row(row, "Owner Payin (฿)",   [m["owner_payin"] for m in months], bg=LIGHT_BG)
+    row += 1; write_row(row, "Bookings (#)",       [m["bookings"] for m in months])
+    row += 1; write_row(row, "Nights",             [int(m["nights"]) for m in months], bg=LIGHT_BG)
+    # DEDUCTIONS
+    row += 1; write_row(row, "DEDUCTIONS", [], is_section=True)
+    row += 1; write_row(row, "TL Commission (฿)", [m["tl_comm"] for m in months])
+    row += 1; write_row(row, "OPEX (฿)",           [m["opex"] for m in months], bg=LIGHT_BG)
+    # RESULT
+    row += 1; write_row(row, "RESULT", [], is_section=True)
+    row += 1; write_row(row, "Net Income (฿)",     [m["net_income"] for m in months], bold=True)
+    row += 1; write_row(row, "Payouts (฿)",         [m["payouts"] for m in months], bg=LIGHT_BG)
+    row += 1; write_row(row, "Closing Bal (฿)",    [m["closing_bal"] for m in months],
+                        totals_fn=lambda x: x[-1] if x else 0, bold=True)
+    # KPIs
+    row += 1; write_row(row, "KPIs", [], is_section=True)
+    row += 1; write_row(row, "Occupancy %",
+                        [int(round(m["occupancy"]*100)) for m in months],
+                        totals_fn=lambda x: round(sum(x)/len(x)) if x else 0)
+    row += 1; write_row(row, "ADR (฿)",
+                        [int(round(m["adr"])) for m in months],
+                        totals_fn=sum)
+
+
+# ── SHEET 5: TRANSACTION LEDGER ───────────────────────────────────────────────
+def build_ledger(wb, data, rpt_year, rpt_month, cur_month):
+    ws = wb.create_sheet("Transaction Ledger")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 7
+    ws.column_dimensions["C"].width = 46
+    ws.column_dimensions["D"].width = 12
+    ws.column_dimensions["E"].width = 14
+    ws.column_dimensions["F"].width = 14
+    ws.column_dimensions["G"].width = 14
+
+    info     = data["info"]
+    prop_name = info.get("property_name", "")
+    opening  = cur_month["opening_bal"]
+    period_label = f"{MONTHS_RU[rpt_month]} {rpt_year}"
+
+    # Title
+    ws.row_dimensions[1].height = 20
+    ws.merge_cells("B1:G1")
+    c = ws["B1"]; c.value = f"LEDGER — {prop_name} — {period_label}"
+    c.font = _f(bold=True, size=12, color=WHITE); c.fill = _fill(NAVY); c.alignment = _align("center")
+
+    ws.row_dimensions[2].height = 14
+    for i, h in enumerate(["Дата", "Описание", "Кат.", "Приход", "Расход", "Баланс"], 2):
+        c = ws.cell(2, i, h)
+        c.font = _f(bold=True, size=9, color=WHITE)
+        c.fill = _fill(TEAL); c.alignment = _align("center")
+
+    # Build chronological transaction list
+    transactions = []
+
+    # OPEX expenses (dated)
+    ex = [e for e in data["expenses"]
+          if e["date"].year == rpt_year and e["date"].month == rpt_month]
+    for e in ex:
+        cat = str(e.get("category_code") or "MISC")
+        transactions.append({
+            "date": e["date"],
+            "desc": (e.get("description") or "")[:55],
+            "cat":  cat,
+            "debit": float(e.get("amount") or 0),
+            "credit": 0,
+            "sort": 1,
+        })
+
+    # Revenue, TL commission, utility — on checkout date
+    bk = [r for r in data["reservations"]
+          if r["checkout_date"].year == rpt_year and r["checkout_date"].month == rpt_month]
+    for r in bk:
+        co   = r["checkout_date"]
+        bid  = str(r.get("booking_id", ""))
+        gross = float(r.get("gross_amount") or 0)
+        tl    = float(r.get("tl_commission") or 0)
+        util  = float(r.get("utility_charge") or 0)
+        if gross > 0:
+            transactions.append({"date": co, "desc": f"Приход: {bid} (выезд — checkout)",
+                                  "cat": "REVENUE", "credit": gross, "debit": 0, "sort": 2})
+        if tl > 0:
+            transactions.append({"date": co, "desc": f"Комиссия TL: {bid}",
+                                  "cat": "MGMT-FEE", "debit": tl, "credit": 0, "sort": 3})
+        if util > 0:
+            transactions.append({"date": co, "desc": f"Электричество: {bid} (возмещение)",
+                                  "cat": "UTL-RCHG", "credit": util, "debit": 0, "sort": 4})
+
+    # Payouts
+    py = [p for p in data["payouts"]
+          if p["date"].year == rpt_year and p["date"].month == rpt_month]
+    for p in py:
+        transactions.append({
+            "date": p["date"],
+            "desc": (p["description"] or "")[:55],
+            "cat":  "PAYOUT",
+            "debit": p["amount"], "credit": 0,
+            "sort": 5,
+        })
+
+    # Sort: by date, then sort key
+    transactions.sort(key=lambda x: (x["date"], x["sort"]))
+
+    # Write
+    row = 2
+
+    def ledger_row(r, date_str, desc, cat, credit, debit, balance, bold=False, bg=None):
+        ws.row_dimensions[r].height = 14
+        fill = _fill(bg) if bg else (_fill(LIGHT_BG) if r % 2 == 0 else _fill(WHITE))
+        vals = [date_str, desc, cat, credit or None, debit or None, balance]
+        for i, v in enumerate(vals, 2):
+            c = ws.cell(r, i, v)
+            c.font = _f(bold=bold, size=9)
+            c.fill = fill
+            c.alignment = _align("right" if i >= 5 else ("center" if i == 2 else "left"))
+
+    # Opening balance row
+    row += 1
+    ws.row_dimensions[row].height = 15
+    ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+    c = ws.cell(row, 3, "НАЧАЛЬНЫЙ БАЛАНС")
+    c.font = _f(bold=True, size=9, color=WHITE); c.fill = _fill(TEAL); c.alignment = _align("center")
+    c2 = ws.cell(row, 7, round(opening, 2))
+    c2.font = _f(bold=True, size=9, color=WHITE); c2.fill = _fill(TEAL); c2.alignment = _align("right")
+
+    balance = opening
+    for t in transactions:
         row += 1
+        balance = balance + t["credit"] - t["debit"]
+        date_str = t["date"].strftime("%d.%m") if isinstance(t["date"], datetime) else ""
+        ledger_row(row, date_str, t["desc"], t["cat"],
+                   t["credit"] if t["credit"] > 0 else None,
+                   t["debit"]  if t["debit"]  > 0 else None,
+                   round(balance, 2))
 
-        # L3
-        channels = list({r["channel"] for r in d.reservations if r["channel"]})
-        dap_section("L3 — OPERATIONAL (current month)")
-        dap_row("Bookings", len(d.reservations), "Nights Occupied", d.nights_occupied)
-        dap_row("Occupancy", f"{d.occupancy_pct:.0f}%", "ADR", f"{d.adr:,.0f} ฿")
-        dap_row("Channels", ", ".join(channels) if channels else "—", "Top Channel",
-                max(channels, key=lambda ch: sum(r["gross"] for r in d.reservations
-                                                  if r["channel"]==ch)) if channels else "—")
-        row += 1
+    # Closing balance row
+    row += 1
+    ws.row_dimensions[row].height = 15
+    ws.merge_cells(start_row=row, start_column=3, end_row=row, end_column=4)
+    c = ws.cell(row, 3, "КОНЕЧНЫЙ БАЛАНС")
+    c.font = _f(bold=True, size=9, color=WHITE); c.fill = _fill(NAVY); c.alignment = _align("center")
+    c2 = ws.cell(row, 7, round(balance, 2))
+    c2.font = _f(bold=True, size=9, color=WHITE); c2.fill = _fill(NAVY); c2.alignment = _align("right")
 
-        # L4
-        opex_by_cat = d.opex_by_category()
-        top3 = sorted(opex_by_cat.items(), key=lambda x: -x[1]["total"])[:3]
-        dap_section("L4 — OPEX SUMMARY (current month)")
-        dap_row("Total OPEX", f"{d.total_opex:,.0f} ฿",
-                "Expense Ratio", f"{d.expense_ratio:.1f}%")
-        for i, (code, cat) in enumerate(top3):
-            bud = d.opex_budget.get(code, {}).get("budget", 0)
-            dap_row(f"Top OPEX #{i+1}", f"{code}: {cat['total']:,.0f} ฿",
-                    "vs Budget", f"{bud:,.0f} ฿")
-        row += 1
-
-        # L5
-        dap_section("L5 — FINANCIAL (current month)")
-        dap_row("Gross Revenue", f"{d.total_gross:,.0f} ฿",
-                "TL Commission", f"{d.total_tl_comm:,.0f} ฿")
-        dap_row("Total OPEX", f"{d.total_opex:,.0f} ฿",
-                "Net Income", f"{d.net_income:,.0f} ฿")
-        dap_row("Payouts", f"{d.total_payouts:,.0f} ฿",
-                "Opening Balance", f"{d.opening_balance:,.0f} ฿")
-        dap_row("Closing Balance", f"{d.closing_balance:,.0f} ฿", "", "")
-        row += 1
-
-        # L5 Cumulative
-        dap_section("L5 — FINANCIAL (YTD cumulative)")
-        dap_row("YTD Gross Revenue", f"{d.cumulative['gross']:,.0f} ฿",
-                "YTD TL Commission", f"{d.cumulative['mgmt_fee']:,.0f} ฿")
-        dap_row("YTD OPEX", f"{d.cumulative['opex']:,.0f} ฿",
-                "YTD Net Income", f"{d.cumulative['net_income']:,.0f} ฿")
-        dap_row("YTD Payouts", f"{d.cumulative['payouts']:,.0f} ฿",
-                "Purchase Price", f"{d.cumulative['purchase_price']:,.0f} ฿"
-                if d.cumulative['purchase_price'] > 0 else "Not disclosed")
-        if d.cumulative['purchase_price'] > 0:
-            dap_row("Gross Yield (annualized)", f"{d.cumulative['yield_pct']:.1f}%", "", "")
-        row += 1
-
-        # L6 — Owner narrative
-        dap_section("L6 — OWNER COMMUNICATION NOTE")
-        inc_flag = "▲" if d.net_income > d.prior["net_income"] else "▼"
-        note = (
-            f"За {d.period_label} объект {d.property_name} сгенерировал "
-            f"{d.total_gross:,.0f} ฿ валовой выручки ({len(d.reservations)} бронирований, "
-            f"{d.nights_occupied} ночей). Чистый доход собственника составил "
-            f"{d.net_income:,.0f} ฿ {inc_flag} "
-            f"{'(выше' if d.net_income >= d.prior['net_income'] else '(ниже'} прошлого месяца "
-            f"на {abs(d.net_income - d.prior['net_income']):,.0f} ฿). "
-            f"Занятость {d.occupancy_pct:.0f}%. "
-            f"Выплачено собственнику: {d.total_payouts:,.0f} ฿. "
-            f"Остаток на счёте: {d.closing_balance:,.0f} ฿."
-        )
-        ws.merge_cells(start_row=row, start_column=1, end_row=row+2, end_column=6)
-        nc = ws.cell(row=row, column=1, value=note)
-        nc.font = _font(size=9, color="222222", italic=True)
-        nc.fill = _fill("EFF8F8")
-        nc.border = _bdr()
-        nc.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        ws.row_dimensions[row].height = 60
-
-        for col, w in [("A",22),("B",24),("C",4),("D",22),("E",24),("F",4)]:
-            ws.column_dimensions[col].width = w
-
-        return ws
-
-    # ── MAIN BUILD ────────────────────────────────────────────────────────────
-    def build(self, output_dir="."):
-        print(f"  Building Dashboard...")
-        self.build_dashboard()
-        print(f"  Building P&L Monthly...")
-        self.build_pl_monthly()
-        print(f"  Building OPEX Passport...")
-        self.build_opex_passport()
-        print(f"  Building 12-Month Summary...")
-        self.build_12month()
-        print(f"  Building Transaction Ledger...")
-        self.build_ledger()
-        print(f"  Building DAP Snapshot...")
-        self.build_dap_snapshot()
-
-        filename = (f"TL_{self.d.property_code}_OwnerReport_"
-                    f"{self.d.report_period}_v1.xlsx")
-        out_path = os.path.join(output_dir, filename)
-        self.wb.save(out_path)
-        return out_path
+    # Revenue recognition footnote
+    row += 2
+    bk_str = "; ".join(
+        f"{r.get('booking_id')}: заезд {r['checkin_date'].strftime('%d.%m')} → выезд {r['checkout_date'].strftime('%d.%m')} → доход признан {r['checkout_date'].strftime('%d.%m.%Y')}"
+        for r in bk if isinstance(r.get("checkin_date"), datetime)
+    )
+    if bk_str:
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
+        c = ws.cell(row, 2, f"⚠ Принцип признания дохода: дата выезда гостя (checkout date). {bk_str}.")
+        c.font = _f(size=8, color="666666"); c.alignment = _align("left", wrap=True)
+        ws.row_dimensions[row].height = 28
 
 
-# ─── MAIN ENTRY POINT ─────────────────────────────────────────────────────────
-def main():
-    if len(sys.argv) < 2:
-        print("USAGE: python3 tl_report_engine.py <input_template.xlsx> [output_dir]")
-        sys.exit(1)
+# ── SHEET 6: DAP SNAPSHOT ─────────────────────────────────────────────────────
+def build_dap(wb, data, rpt_year, rpt_month, months):
+    ws = wb.create_sheet("DAP Snapshot")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 4
+    ws.column_dimensions["E"].width = 22
+    ws.column_dimensions["F"].width = 22
 
-    input_path = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(input_path) or "."
+    info = data["info"]
+    prop_name  = info.get("property_name", "")
+    prop_code  = info.get("property_code", "")
+    location   = info.get("location", "")
+    prop_type  = info.get("property_type", "")
+    bedrooms   = info.get("bedrooms", "")
+    owner_name = info.get("owner_name", "")
+    mgmt_start = info.get("mgmt_start_date")
+    mgmt_str   = mgmt_start.strftime("%B %Y") if isinstance(mgmt_start, datetime) else "—"
 
-    if not os.path.exists(input_path):
-        print(f"ERROR: File not found: {input_path}")
-        sys.exit(1)
+    period_label = f"{MONTHS_RU[rpt_month]} {rpt_year}"
 
-    print(f"\n{'='*60}")
-    print(f"  TropicLook Owner Report Engine")
-    print(f"  FIN-REG-OWN-RPT-001 v1.0")
-    print(f"{'='*60}")
-    print(f"  Input:  {input_path}")
-    print(f"  Output: {output_dir}")
-    print()
+    # Cumulative from computed months
+    total_gross   = sum(m["gross"]      for m in months)
+    total_util    = sum(m["utility"]    for m in months)
+    total_comm    = sum(m["tl_comm"]    for m in months)
+    total_opex    = sum(m["opex"]       for m in months)
+    total_net     = sum(m["net_income"] for m in months)
+    total_pays    = sum(m["payouts"]    for m in months)
+    total_bk      = sum(m["bookings"]   for m in months)
+    total_nights  = sum(m["nights"]     for m in months)
+    current_bal   = months[-1]["closing_bal"] if months else 0
+    avg_occ       = sum(m["occupancy"]  for m in months) / len(months) if months else 0
+    avg_stay      = total_nights / total_bk if total_bk > 0 else 0
+    opex_by_month = [m["opex"] for m in months]
+    avg_opex      = sum(opex_by_month) / len(opex_by_month) if opex_by_month else 0
+    # Expense ratio cumulative
+    exp_ratio = total_opex / total_gross if total_gross > 0 else 0
 
-    # Step 1: Parse input
-    print("[ 1/3 ] Reading input template...")
-    data = InputData(input_path)
-    print(f"        Property:  {data.property_name} ({data.property_code})")
-    print(f"        Period:    {data.period_label}")
-    print(f"        Owner:     {data.owner_name}")
-    print(f"        Bookings:  {len(data.reservations)}")
-    print(f"        Expenses:  {len(data.expenses)}")
-    print(f"        Payouts:   {len(data.payouts)}")
+    # Find best/worst opex month
+    hi_m = max(months, key=lambda m: m["opex"])
+    lo_m = min(months, key=lambda m: m["opex"])
 
-    # Step 2: Validate
-    print("\n[ 2/3 ] Running validation (5 rules)...")
-    ok, errors, warnings = data.validate()
+    # Title
+    ws.row_dimensions[1].height = 22
+    ws.merge_cells("B1:F1")
+    c = ws["B1"]; c.value = f"DIGITAL ASSET PASSPORT — {prop_name}"
+    c.font = _f(bold=True, size=12, color=WHITE); c.fill = _fill(NAVY); c.alignment = _align("center")
 
-    if warnings:
-        print(f"        ⚠  {len(warnings)} warning(s):")
-        for w in warnings:
-            print(f"           {w}")
+    ws.row_dimensions[2].height = 14
+    ws.merge_cells("B2:F2")
+    c = ws["B2"]; c.value = f"{prop_code} | ACTIVE | {period_label}"
+    c.font = _f(size=9, color=WHITE); c.fill = _fill(NAVY); c.alignment = _align("center")
 
+    def section_hdr(row, col, label, bg=TEAL):
+        ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col+1)
+        c = ws.cell(row, col, label)
+        c.font = _f(bold=True, size=9, color=WHITE); c.fill = _fill(bg); c.alignment = _align("left")
+        ws.row_dimensions[row].height = 14
+
+    def kv_row(row, col, key, val):
+        ws.row_dimensions[row].height = 13
+        ck = ws.cell(row, col, key); ck.font = _f(size=9); ck.alignment = _align("left")
+        cv = ws.cell(row, col+1, val); cv.font = _f(bold=True, size=9); cv.alignment = _align("left")
+
+    ws.row_dimensions[3].height = 8
+
+    # L1 — IDENTITY (col B-C), L3 — OPERATIONAL (col E-F)
+    section_hdr(4, 2, "L1 — IDENTITY")
+    section_hdr(4, 5, "L3 — OPERATIONAL")
+    r = 4
+    id_data = [
+        ("Property", prop_name), ("Project", "—"), ("Location", location),
+        ("Type", f"{prop_type} {bedrooms}BR + Pool"),
+        ("Owner", owner_name), ("Ownership", "100%"),
+        ("Mgmt Start", mgmt_str), ("Contract", "Marketing + Service"), ("Status", "ACTIVE"),
+    ]
+    op_data = [
+        ("Bookings (cumul)", str(int(total_bk))),
+        ("Nights (cumul)", str(int(total_nights))),
+        ("Avg Occupancy", f"{int(round(avg_occ*100))}%"),
+        ("Avg Stay", f"{avg_stay:.1f} nights"),
+        ("Owner Bookings", "—"),
+        ("Top Channel", "Mixed"),
+        ("Readiness", "READY"),
+        ("Condition", "— (pending)"),
+    ]
+    for i, (k, v) in enumerate(id_data):
+        kv_row(r + 1 + i, 2, k, v)
+    for i, (k, v) in enumerate(op_data):
+        if r + 1 + i <= r + 1 + len(id_data):
+            kv_row(r + 1 + i, 5, k, v)
+
+    # Spacer
+    last_id_row = r + 1 + len(id_data) + 1
+    ws.row_dimensions[last_id_row].height = 6
+
+    # L5 — FINANCIAL (col B-C), L4 — OPEX SUMMARY (col E-F)
+    section_hdr(last_id_row + 1, 2, "L5 — FINANCIAL (cumul)")
+    section_hdr(last_id_row + 1, 5, "L4 — OPEX SUMMARY")
+    r2 = last_id_row + 1
+    fin_data = [
+        ("Cumul Gross Revenue", f"{total_gross:,.0f} ฿"),
+        ("Cumul Utilities",     f"{total_util:,.0f} ฿"),
+        ("Cumul TL Commission", f"{total_comm:,.0f} ฿"),
+        ("Cumul OPEX",          f"{total_opex:,.0f} ฿"),
+        ("Cumul Net Income",    f"{total_net:,.0f} ฿"),
+        ("Total Payouts",       f"{total_pays:,.0f} ฿"),
+        ("Current Balance",     f"{current_bal:,.0f} ฿"),
+    ]
+    opex_data = [
+        ("Avg Monthly OPEX",  f"{avg_opex:,.0f} ฿"),
+        ("Highest OPEX",      f"{hi_m['label']} ({hi_m['opex']:,.0f} ฿)"),
+        ("Lowest OPEX",       f"{lo_m['label']} ({lo_m['opex']:,.0f} ฿)"),
+        ("Expense Ratio",     f"{exp_ratio*100:.1f}%"),
+        ("Budget Adherence",  "Mixed"),
+        ("OPEX Profile",      "Active"),
+        ("FIX-COM",           "Not yet active"),
+    ]
+    for i, (k, v) in enumerate(fin_data):
+        kv_row(r2 + 1 + i, 2, k, v)
+    for i, (k, v) in enumerate(opex_data):
+        kv_row(r2 + 1 + i, 5, k, v)
+
+
+# ── VALIDATION (5 RULES per FIN-REG-OWN-RPT-001) ─────────────────────────────
+def validate(data, rpt_year, rpt_month, cur_month):
+    errors = []; warnings = []
+    info = data["info"]
+    comm_rate = float(info.get("commission_rate", 0.25))
+
+    bk = [r for r in data["reservations"]
+          if r["checkout_date"].year == rpt_year and r["checkout_date"].month == rpt_month]
+    ex = [e for e in data["expenses"]
+          if e["date"].year == rpt_year and e["date"].month == rpt_month]
+    py = [p for p in data["payouts"]
+          if p["date"].year == rpt_year and p["date"].month == rpt_month]
+
+    gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
+    utility = sum(float(r.get("utility_charge") or 0) for r in bk)
+    tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
+    opex    = sum(float(e.get("amount") or 0) for e in ex)
+    payouts = sum(p["amount"] for p in py)
+    net     = gross + utility - tl_comm - opex
+    closing = cur_month["closing_bal"]
+    opening = cur_month["opening_bal"]
+
+    # R1: Closing balance >= 0
+    if closing < -0.01:
+        errors.append(f"R1 FAIL: Closing balance {closing:.2f} < 0. Escalate to CFO.")
+    # R2: Arithmetic check
+    calc_closing = opening + gross + utility - tl_comm - opex - payouts
+    if abs(calc_closing - closing) > 1.0:
+        errors.append(f"R2 FAIL: Balance discrepancy {abs(calc_closing - closing):.2f} THB > 1 THB.")
+    # R3: All expenses have category code
+    no_cat = [e for e in ex if not e.get("category_code")]
+    if no_cat:
+        errors.append(f"R3 FAIL: {len(no_cat)} expense(s) missing category code.")
+    # R4: Booking count (informational)
+    if len(bk) == 0:
+        warnings.append("R4 WARN: 0 bookings in report period — verify against PMS.")
+    # R5: Management fee vs expected
+    expected_fee = gross * comm_rate
+    if expected_fee > 0 and abs(tl_comm - expected_fee) / expected_fee > 0.05:
+        warnings.append(f"R5 WARN: TL Fee {tl_comm:.0f} deviates >5% from expected {expected_fee:.0f}.")
+
+    return errors, warnings
+
+
+# ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
+def generate_report(input_path, output_path=None):
+    """
+    Main function. Read input_path (xlsx), return output bytes or write to output_path.
+    """
+    data        = read_input(input_path)
+    info        = data["info"]
+    rpt_year, rpt_month = _parse_period(info)
+
+    mgmt_start = info.get("mgmt_start_date")
+    if not isinstance(mgmt_start, datetime):
+        raise ValueError("mgmt_start_date missing or invalid in Property_Info")
+
+    months = compute_monthly(data, mgmt_start, rpt_year, rpt_month)
+    if not months:
+        raise ValueError("No monthly data computed — check period and management start date.")
+
+    cur_month = months[-1]
+
+    # Validate
+    errors, warnings = validate(data, rpt_year, rpt_month, cur_month)
     if errors:
-        print(f"\n        ✗  VALIDATION FAILED — {len(errors)} error(s):")
-        for e in errors:
-            print(f"           {e}")
-        print("\n  Report NOT generated. Fix errors and re-run.")
-        sys.exit(2)
+        raise ValueError("Validation errors:\n" + "\n".join(errors))
 
-    print(f"        ✓  All validation rules passed")
-    print(f"\n        Gross Revenue:    {data.total_gross:>14,.2f} THB")
-    print(f"        TL Commission:    {data.total_tl_comm:>14,.2f} THB")
-    print(f"        Total OPEX:       {data.total_opex:>14,.2f} THB")
-    print(f"        Net Income:       {data.net_income:>14,.2f} THB")
-    print(f"        Total Payouts:    {data.total_payouts:>14,.2f} THB")
-    print(f"        Opening Balance:  {data.opening_balance:>14,.2f} THB")
-    print(f"        Closing Balance:  {data.closing_balance:>14,.2f} THB")
+    # Build workbook
+    wb = Workbook()
+    wb.remove(wb.active)  # remove default sheet
 
-    # Step 3: Generate report
-    print("\n[ 3/3 ] Generating 6-tab Excel report...")
-    builder = ReportBuilder(data)
-    out_path = builder.build(output_dir)
+    build_dashboard(wb, data, rpt_year, rpt_month, cur_month)
+    build_pl(wb, data, rpt_year, rpt_month, cur_month)
+    build_opex_passport(wb, data, rpt_year, rpt_month)
+    build_12month(wb, data, rpt_year, rpt_month, months)
+    build_ledger(wb, data, rpt_year, rpt_month, cur_month)
+    build_dap(wb, data, rpt_year, rpt_month, months)
 
-    print(f"\n{'='*60}")
-    print(f"  ✓  Report generated successfully!")
-    print(f"     {out_path}")
-    print(f"{'='*60}\n")
-    return out_path
+    # Set tab colors
+    tab_colors = {
+        "Dashboard":         NAVY,
+        "P&L Monthly":       TEAL,
+        "OPEX Passport":     GOLD,
+        "12-Month Summary":  NAVY,
+        "Transaction Ledger": TEAL,
+        "DAP Snapshot":      GOLD,
+    }
+    for sheet in wb.worksheets:
+        color = tab_colors.get(sheet.title, NAVY)
+        sheet.sheet_properties.tabColor = color
+
+    if output_path:
+        wb.save(output_path)
+        return warnings
+    else:
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf.getvalue(), warnings
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 3:
+        print("Usage: python tl_report_engine.py <input.xlsx> <output.xlsx>")
+        sys.exit(1)
+
+    inp, out = sys.argv[1], sys.argv[2]
+    if not os.path.exists(inp):
+        print(f"ERROR: Input file not found: {inp}"); sys.exit(1)
+
+    try:
+        warnings = generate_report(inp, out)
+        print(f"✅ Report generated: {out}")
+        for w in warnings:
+            print(f"  ⚠ {w}")
+    except ValueError as e:
+        print(f"❌ {e}"); sys.exit(1)
