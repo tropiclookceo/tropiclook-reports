@@ -1,142 +1,64 @@
-"""
-TropicLook Report Server
-Принимает Excel INPUT TEMPLATE, возвращает готовый Owner Report Excel.
-
-Make.com отправляет файл сюда → сервер генерирует отчёт → возвращает файл
-"""
-
 import os
 import tempfile
-import traceback
 from flask import Flask, request, jsonify, send_file
-
-# Импортируем наш движок
-from tl_report_engine import InputData, ReportBuilder
+from tl_report_engine import generate_report
 
 app = Flask(__name__)
 
-# Простая защита: Make.com должен передавать этот токен в заголовке
 API_TOKEN = os.environ.get("API_TOKEN", "tropiclook-secret-change-me")
+
+
+def _check_token():
+    token = request.headers.get("X-API-Token", "")
+    return token == API_TOKEN
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Проверка что сервер работает. Make.com может пинговать этот URL."""
-    return jsonify({"status": "ok", "service": "TropicLook Report Engine v1.0"})
+    return jsonify({"status": "ok"})
 
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    """
-    Принимает INPUT TEMPLATE Excel, генерирует Owner Report Excel.
-
-    Make.com отправляет запрос:
-      - Header: X-API-Token: <токен>
-      - Body: multipart/form-data с полем "file" = Excel файл
-    Возвращает: готовый Excel файл для скачивания
-    """
-
-    # Проверяем токен
-    token = request.headers.get("X-API-Token", "")
-    if token != API_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    # Проверяем что файл передан
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded. Send Excel as 'file' field."}), 400
-
-    uploaded_file = request.files["file"]
-    if not uploaded_file.filename.endswith(".xlsx"):
-        return jsonify({"error": "File must be .xlsx"}), 400
-
-    # Сохраняем входящий файл во временную папку
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.xlsx")
-        output_dir = tmpdir
-        uploaded_file.save(input_path)
-
-        try:
-            # Читаем данные
-            data = InputData(input_path)
-
-            # Валидация
-            ok, errors, warnings = data.validate()
-
-            if not ok:
-                # Возвращаем список ошибок — бухгалтер получит уведомление
-                return jsonify({
-                    "status": "validation_failed",
-                    "property": data.property_name,
-                    "period": data.report_period,
-                    "errors": errors,
-                    "warnings": warnings
-                }), 422
-
-            # Генерируем отчёт
-            builder = ReportBuilder(data)
-            out_path = builder.build(output_dir)
-
-            # Возвращаем готовый Excel файл
-            return send_file(
-                out_path,
-                as_attachment=True,
-                download_name=os.path.basename(out_path),
-                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-        except Exception as e:
-            # Любая другая ошибка — возвращаем текст для диагностики
-            error_detail = traceback.format_exc()
-            print(f"ERROR processing {uploaded_file.filename}:\n{error_detail}")
-            return jsonify({
-                "status": "error",
-                "message": str(e),
-                "detail": error_detail
-            }), 500
-
-
-@app.route("/validate", methods=["POST"])
-def validate_only():
-    """
-    Только проверяет файл без генерации отчёта.
-    Удобно для быстрой проверки перед отправкой.
-    """
-    token = request.headers.get("X-API-Token", "")
-    if token != API_TOKEN:
+    if not _check_token():
         return jsonify({"error": "Unauthorized"}), 401
 
     if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+        return jsonify({"error": "No file provided"}), 400
 
-    uploaded_file = request.files["file"]
+    uploaded = request.files["file"]
+    if not uploaded.filename:
+        return jsonify({"error": "Empty filename"}), 400
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.xlsx")
-        uploaded_file.save(input_path)
+    # Save input to temp file
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_in:
+        uploaded.save(tmp_in.name)
+        input_path = tmp_in.name
 
+    output_path = input_path.replace(".xlsx", "_report.xlsx")
+
+    try:
+        warnings = generate_report(input_path, output_path)
+    except ValueError as e:
+        os.unlink(input_path)
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        os.unlink(input_path)
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
+    finally:
         try:
-            data = InputData(input_path)
-            ok, errors, warnings = data.validate()
+            os.unlink(input_path)
+        except Exception:
+            pass
 
-            return jsonify({
-                "status": "ok" if ok else "validation_failed",
-                "property": data.property_name,
-                "property_code": data.property_code,
-                "period": data.report_period,
-                "owner": data.owner_name,
-                "bookings": len(data.reservations),
-                "expenses": len(data.expenses),
-                "payouts": len(data.payouts),
-                "gross_revenue": data.total_gross,
-                "net_income": data.net_income,
-                "closing_balance": data.closing_balance,
-                "errors": errors,
-                "warnings": warnings
-            })
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
+    return send_file(
+        output_path,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="owner_report.xlsx",
+    )
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
