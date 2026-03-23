@@ -113,15 +113,16 @@ def read_input(path):
     wb = load_workbook(path, read_only=True, data_only=True)
     data = {}
 
-    # Property_Info
+    # Property_Info — vertical layout: column A = key, column B = value
+    import re as _re
     ws = wb["Property_Info"]
-    rows = [r for r in ws.iter_rows(values_only=True) if any(r)]
     pi = {}
-    if len(rows) >= 2:
-        keys = rows[0]
-        vals = rows[1]
-        for k, v in zip(keys, vals):
-            if k: pi[str(k).strip()] = v
+    for row in ws.iter_rows(values_only=True):
+        if not any(row): continue
+        key = row[0]
+        val = row[1] if len(row) > 1 else None
+        if key and isinstance(key, str) and _re.match(r'^[a-z_]+$', key.strip()):
+            pi[key.strip()] = val
     data["info"] = pi
 
     # Reservations
