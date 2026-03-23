@@ -650,7 +650,9 @@ def build_opex_passport(wb, data, rpt_year, rpt_month):
         for i, v in enumerate(vals, 2):
             c = ws.cell(row, i, v)
             c.font = _f(size=9); c.fill = fill; c.alignment = _align("center" if i >= 3 else "left")
-            if i == 6:  # status
+            if i == 6:  # Δ% column — format as percentage
+                c.number_format = '0.0%'
+            if i == 7:  # status emoji
                 c.font = _f(size=11)
         total_bgt += bgt; total_fact += fact
 
