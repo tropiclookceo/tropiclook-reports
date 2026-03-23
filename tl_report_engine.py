@@ -123,6 +123,14 @@ def read_input(path):
         val = row[1] if len(row) > 1 else None
         if key and isinstance(key, str) and _re.match(r'^[a-z_]+$', key.strip()):
             pi[key.strip()] = val
+    # Convert date fields stored as strings
+    if "mgmt_start_date" in pi:
+        from datetime import datetime as _dt
+        d = pi["mgmt_start_date"]
+        if isinstance(d, str):
+            for fmt in ('%Y-%m-%d', '%d.%m.%Y'):
+                try: pi["mgmt_start_date"] = _dt.strptime(d.strip(), fmt); break
+                except ValueError: pass
     data["info"] = pi
 
     # Reservations
@@ -133,10 +141,14 @@ def read_input(path):
         if not any(row): continue
         if str(row[0]).startswith("NOTES"): break
         if headers is None:
-            headers = [str(h).strip() if h else "" for h in row]
+            # Only treat row as headers if first cell is a lowercase field name
+            if row[0] and isinstance(row[0], str) and _re.match(r'^[a-z_]+$', str(row[0]).strip()):
+                headers = [str(h).strip() if h else "" for h in row]
             continue
         if len(row) < 5: continue
         r = dict(zip(headers, row))
+        for df in ("checkin_date", "checkout_date"):
+            r[df] = _to_date(r.get(df))
         if isinstance(r.get("checkout_date"), datetime):
             res.append(r)
     data["reservations"] = res
@@ -149,10 +161,14 @@ def read_input(path):
         if not any(row): continue
         if str(row[0]).startswith("NOTES"): break
         if headers is None:
-            headers = [str(h).strip() if h else "" for h in row]
+            # Only treat row as headers if first cell is a lowercase field name
+            if row[0] and isinstance(row[0], str) and _re.match(r'^[a-z_]+$', str(row[0]).strip()):
+                headers = [str(h).strip() if h else "" for h in row]
             continue
-        if not isinstance(row[0], datetime): continue
+        date_val = _to_date(row[0])
+        if not date_val: continue
         r = dict(zip(headers, row))
+        r["date"] = date_val
         exp.append(r)
     data["expenses"] = exp
 
@@ -161,9 +177,10 @@ def read_input(path):
     pay = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row or len(row) < 2: continue
-        if not isinstance(row[0], datetime): continue
+        date_val = _to_date(row[0])
+        if not date_val: continue
         pay.append({
-            "date": row[0], "amount": float(row[1] or 0),
+            "date": date_val, "amount": float(row[1] or 0),
             "type": row[2], "reference": row[3],
             "description": row[4] or "",
         })
@@ -195,6 +212,17 @@ def read_input(path):
 
     wb.close()
     return data
+
+
+# ── DATE HELPERS ──────────────────────────────────────────────────────────────
+def _to_date(val):
+    """Convert string or datetime to datetime object, return None if unparseable."""
+    if isinstance(val, datetime): return val
+    if isinstance(val, str):
+        for fmt in ('%Y-%m-%d', '%d.%m.%Y', '%Y/%m/%d'):
+            try: return datetime.strptime(val.strip(), fmt)
+            except ValueError: pass
+    return None
 
 
 # ── PERIOD HELPERS ────────────────────────────────────────────────────────────
