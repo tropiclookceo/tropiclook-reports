@@ -224,6 +224,22 @@ def _to_date(val):
             except ValueError: pass
     return None
 
+def _to_bool(val, default=False):
+    """Best-effort bool parser for template flags."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in {"1", "true", "yes", "y", "on", "strict", "block"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", "warn", "warning"}:
+            return False
+    return default
+
 
 # ── PERIOD HELPERS ────────────────────────────────────────────────────────────
 def _parse_period(info):
@@ -1056,6 +1072,8 @@ def validate(data, rpt_year, rpt_month, cur_month):
     errors = []; warnings = []
     info = data["info"]
     comm_rate = float(info.get("commission_rate", 0.25))
+    # Non-blocking by default to avoid stopping the pipeline on CFO-escalation cases.
+    block_on_negative_balance = _to_bool(info.get("block_on_negative_balance"), default=False)
 
     bk = [r for r in data["reservations"]
           if r["checkout_date"].year == rpt_year and r["checkout_date"].month == rpt_month]
@@ -1075,7 +1093,11 @@ def validate(data, rpt_year, rpt_month, cur_month):
 
     # R1: Closing balance >= 0
     if closing < -0.01:
-        errors.append(f"R1 FAIL: Closing balance {closing:.2f} < 0. Escalate to CFO.")
+        msg = f"R1 FAIL: Closing balance {closing:.2f} < 0. Escalate to CFO."
+        if block_on_negative_balance:
+            errors.append(msg)
+        else:
+            warnings.append(msg.replace("R1 FAIL", "R1 WARN") + " Report generated in non-blocking mode.")
     # R2: Arithmetic check
     calc_closing = opening + gross + utility - tl_comm - opex - payouts
     if abs(calc_closing - closing) > 1.0:
