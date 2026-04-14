@@ -10,7 +10,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime
 from collections import defaultdict
-import calendar, sys, os, io
+import argparse, calendar, sys, os, io, re
 
 # ── BRAND ─────────────────────────────────────────────────────────────────────
 NAVY     = "1F3864"
@@ -75,6 +75,25 @@ def _thb(val):
 def _pct(val):
     if val is None: return "—%"
     return f"{int(round(val * 100))}%"
+
+def _num_or_none(val):
+    """Best-effort numeric parser for optional template values."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        v = val.strip().replace(",", "").replace(" ", "")
+        if not v:
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+def _round_money(val):
+    return round(float(val or 0), 2)
 
 def _style_header_row(ws, row, cols, bg=NAVY, fg=WHITE, bold=True, size=10):
     for c in cols:
@@ -252,6 +271,14 @@ def _parse_period(info):
         if len(parts) == 2:
             return int(parts[0]), int(parts[1])
     raise ValueError(f"Cannot parse period: {p}")
+
+def _period_str(year, month):
+    return f"{year:04d}-{month:02d}"
+
+def _next_period(year, month):
+    if month == 12:
+        return year + 1, 1
+    return year, month + 1
 
 def _month_days(year, month):
     return calendar.monthrange(year, month)[1]
@@ -1117,6 +1144,172 @@ def validate(data, rpt_year, rpt_month, cur_month):
     return errors, warnings
 
 
+# ── NEXT INPUT TEMPLATE ROLLFORWARD ──────────────────────────────────────────
+def _find_key_row(ws, key, key_col=1):
+    """Find a row in a vertical key/value sheet by the key in column A."""
+    for row in range(1, ws.max_row + 1):
+        if ws.cell(row=row, column=key_col).value == key:
+            return row
+    raise KeyError(f"Key '{key}' not found in sheet '{ws.title}'.")
+
+def _set_kv(ws, key, value, key_col=1, value_col=2):
+    row = _find_key_row(ws, key, key_col=key_col)
+    ws.cell(row=row, column=value_col).value = value
+
+def _clear_kv(ws, key, key_col=1, value_col=2):
+    row = _find_key_row(ws, key, key_col=key_col)
+    ws.cell(row=row, column=value_col).value = None
+
+def _next_input_filename(input_path, current_period, next_period):
+    """Derive the next InputData filename from the current file name."""
+    name = os.path.basename(input_path).replace("OwnerReport", "InputData")
+    if current_period in name:
+        return name.replace(current_period, next_period, 1)
+    stem, ext = os.path.splitext(name)
+    ext = ext or ".xlsx"
+    replaced = re.sub(r"\d{4}-\d{2}$", next_period, stem)
+    if replaced != stem:
+        return f"{replaced}{ext}"
+    return f"{stem}_{next_period}{ext}"
+
+def _rollforward_snapshot(data, months):
+    """
+    Build all values that carry from the closed month into the next input file.
+
+    The carry-forward rule is intentionally narrow:
+    - current month KPI/result values go to Prior_Period;
+    - cumulative values are recomputed through the current closed month;
+    - current closing balance becomes the next month's opening balance.
+    """
+    info = data["info"]
+    cur = months[-1]
+    days = _month_days(cur["year"], cur["month"])
+    revpar = (cur["gross"] / days) if days else 0
+
+    total_gross = sum(m["gross"] for m in months)
+    total_opex = sum(m["opex"] for m in months)
+    total_fee = sum(m["tl_comm"] for m in months)
+    total_net = sum(m["net_income"] for m in months)
+    total_payouts = sum(m["payouts"] for m in months)
+
+    existing_yield = _num_or_none(data.get("cumulative", {}).get("annualized_yield"))
+    property_value = (
+        _num_or_none(info.get("property_value"))
+        or _num_or_none(info.get("estimated_property_value"))
+        or _num_or_none(info.get("investment_value"))
+    )
+    annualized_yield = existing_yield
+    if property_value and property_value > 0 and months:
+        annualized_yield = (total_net / property_value) * (12 / len(months))
+
+    mgmt_start = info.get("mgmt_start_date")
+    mgmt_start_str = (
+        mgmt_start.strftime("%Y-%m-%d") if isinstance(mgmt_start, datetime)
+        else str(mgmt_start or "")
+    )
+
+    return {
+        "prior_period": {
+            "gross_revenue": _round_money(cur["gross"]),
+            "mgmt_fee": _round_money(cur["tl_comm"]),
+            "total_opex": _round_money(cur["opex"]),
+            "net_income": _round_money(cur["net_income"]),
+            "cash_balance_end": _round_money(cur["closing_bal"]),
+            "occupancy_pct": round(float(cur["occupancy"] or 0), 4),
+            "adr": _round_money(cur["adr"]),
+            "revpar": _round_money(revpar),
+        },
+        "cumulative": {
+            "cumulative_gross_revenue": _round_money(total_gross),
+            "cumulative_opex": _round_money(total_opex),
+            "cumulative_mgmt_fee": _round_money(total_fee),
+            "cumulative_net_income": _round_money(total_net),
+            "total_owner_payouts": _round_money(total_payouts),
+            "annualized_yield": round(annualized_yield, 6) if annualized_yield is not None else None,
+            "management_start_date": mgmt_start_str,
+            "months_managed": len(months),
+        },
+        "cash_balance": {
+            "opening_balance": _round_money(cur["closing_bal"]),
+        },
+    }
+
+def generate_next_input_template(input_path, output_path=None):
+    """
+    Create the next month's InputData workbook from the current closed input.
+
+    This is the rollforward step for the three tabs finance currently
+    re-enters manually:
+    - Prior_Period receives current month KPIs;
+    - Cumulative receives recomputed management-to-date totals;
+    - Cash_Balance receives opening_balance = current closing_balance.
+
+    The month activity fields in Cash_Balance are cleared because they belong
+    to the next reporting month and must be populated by the next source pack.
+    """
+    data = read_input(input_path)
+    info = data["info"]
+    rpt_year, rpt_month = _parse_period(info)
+    next_year, next_month = _next_period(rpt_year, rpt_month)
+    current_period = _period_str(rpt_year, rpt_month)
+    next_period = _period_str(next_year, next_month)
+
+    mgmt_start = info.get("mgmt_start_date")
+    if not isinstance(mgmt_start, datetime):
+        raise ValueError("mgmt_start_date missing or invalid in Property_Info")
+
+    months = compute_monthly(data, mgmt_start, rpt_year, rpt_month)
+    if not months:
+        raise ValueError("No monthly data computed — cannot roll forward next input template.")
+
+    cur_month = months[-1]
+    errors, warnings = validate(data, rpt_year, rpt_month, cur_month)
+    if errors:
+        raise ValueError("Validation errors; next input template not created:\n" + "\n".join(errors))
+
+    wb = load_workbook(input_path)
+    snapshot = _rollforward_snapshot(data, months)
+
+    # Property_Info: the workbook becomes the next reporting period.
+    _set_kv(wb["Property_Info"], "period", next_period)
+
+    # Prior_Period: current closed month becomes the previous month for MoM.
+    ws_prior = wb["Prior_Period"]
+    for key, value in snapshot["prior_period"].items():
+        _set_kv(ws_prior, key, value)
+
+    # Cumulative: recompute through the current closed month.
+    ws_cumul = wb["Cumulative"]
+    for key, value in snapshot["cumulative"].items():
+        _set_kv(ws_cumul, key, value)
+
+    # Cash_Balance: only the next opening balance is known at rollforward time.
+    ws_cash = wb["Cash_Balance"]
+    _set_kv(ws_cash, "opening_balance", snapshot["cash_balance"]["opening_balance"])
+    for key in ("total_income", "total_mgmt_fee", "total_opex", "total_payouts"):
+        _clear_kv(ws_cash, key)
+
+    output_name = _next_input_filename(input_path, current_period, next_period)
+    metadata = {
+        "current_period": current_period,
+        "next_period": next_period,
+        "next_input_name": output_name,
+        "opening_balance": snapshot["cash_balance"]["opening_balance"],
+        "warnings": warnings,
+    }
+
+    if output_path:
+        wb.save(output_path)
+        wb.close()
+        return metadata
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    wb.close()
+    buf.seek(0)
+    return buf.getvalue(), metadata
+
+
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
 def generate_report(input_path, output_path=None):
     """
@@ -1174,14 +1367,40 @@ def generate_report(input_path, output_path=None):
         buf.seek(0)
         return buf.getvalue(), warnings
 
+def generate_report_bundle(input_path):
+    """
+    Return both generated artifacts for API integrations:
+    1) current owner report bytes;
+    2) next month's prefilled InputData bytes.
+
+    Flask / Make.com can use this helper when the scenario needs to upload both
+    files from one request.
+    """
+    report_bytes, warnings = generate_report(input_path)
+    next_input_bytes, next_input_meta = generate_next_input_template(input_path)
+    return {
+        "report_bytes": report_bytes,
+        "next_input_bytes": next_input_bytes,
+        "warnings": warnings,
+        "next_input": next_input_meta,
+    }
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python tl_report_engine.py <input.xlsx> <output.xlsx>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Generate TropicLook Owner Report and optionally roll forward next InputData."
+    )
+    parser.add_argument("input", help="Current TL_[CODE]_InputData_[YYYY-MM].xlsx file")
+    parser.add_argument("output", help="Output TL_[CODE]_OwnerReport_[YYYY-MM].xlsx file")
+    parser.add_argument(
+        "--next-input",
+        dest="next_input",
+        help="Optional output path for prefilled next-month TL_[CODE]_InputData_[YYYY-MM].xlsx",
+    )
+    args = parser.parse_args()
 
-    inp, out = sys.argv[1], sys.argv[2]
+    inp, out = args.input, args.output
     if not os.path.exists(inp):
         print(f"ERROR: Input file not found: {inp}"); sys.exit(1)
 
@@ -1190,5 +1409,12 @@ if __name__ == "__main__":
         print(f"✅ Report generated: {out}")
         for w in warnings:
             print(f"  ⚠ {w}")
+        if args.next_input:
+            meta = generate_next_input_template(inp, args.next_input)
+            print(
+                "✅ Next input template generated: "
+                f"{args.next_input} ({meta['current_period']} → {meta['next_period']}, "
+                f"opening_balance={meta['opening_balance']:,.2f})"
+            )
     except ValueError as e:
         print(f"❌ {e}"); sys.exit(1)
