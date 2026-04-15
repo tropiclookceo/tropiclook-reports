@@ -84,6 +84,7 @@ def _num_or_none(val):
         return float(val)
     if isinstance(val, str):
         v = val.strip().replace(",", "").replace(" ", "")
+        v = re.sub(r"[^\d.\-]", "", v)
         if not v:
             return None
         try:
@@ -92,8 +93,40 @@ def _num_or_none(val):
             return None
     return None
 
+def _ratio_or_none(val):
+    """
+    Parse a percent-like value as a spreadsheet ratio.
+
+    Input templates historically described percentage fields as decimals
+    (0.087 = 8.7%). Finance now wants these cells to display as percentages.
+    This parser accepts both 0.087 and 8.7 and normalizes them to 0.087.
+    """
+    num = _num_or_none(val)
+    if num is None:
+        return None
+    if abs(num) > 1:
+        return num / 100
+    return num
+
 def _round_money(val):
     return round(float(val or 0), 2)
+
+def _property_purchase_price(info):
+    """Return the managed unit purchase price used for annualized yield."""
+    for key in (
+        "asset_purchase_price",
+        "property_purchase_price",
+        "unit_purchase_price",
+        "purchase_price",
+        "property_value",
+        "asset_value",
+        "estimated_property_value",
+        "investment_value",
+    ):
+        value = _num_or_none(info.get(key))
+        if value is not None:
+            return value
+    return None
 
 def _style_header_row(ws, row, cols, bg=NAVY, fg=WHITE, bold=True, size=10):
     for c in cols:
@@ -1152,9 +1185,39 @@ def _find_key_row(ws, key, key_col=1):
             return row
     raise KeyError(f"Key '{key}' not found in sheet '{ws.title}'.")
 
-def _set_kv(ws, key, value, key_col=1, value_col=2):
+def _last_metric_row(ws, key_col=1):
+    last = 0
+    for row in range(1, ws.max_row + 1):
+        val = ws.cell(row=row, column=key_col).value
+        if isinstance(val, str) and re.match(r"^[a-z_]+$", val.strip()):
+            last = row
+    return last or ws.max_row
+
+def _ensure_kv(ws, key, value=None, note=None, key_col=1, value_col=2):
+    """
+    Ensure a vertical key/value field exists.
+
+    Used for new template fields so older InputData files can roll forward
+    into the updated template shape without manual sheet surgery.
+    """
+    try:
+        row = _find_key_row(ws, key, key_col=key_col)
+    except KeyError:
+        row = _last_metric_row(ws, key_col=key_col) + 1
+        ws.insert_rows(row)
+        ws.cell(row=row, column=key_col).value = key
+    if value is not None:
+        ws.cell(row=row, column=value_col).value = value
+    if note is not None:
+        ws.cell(row=row, column=value_col + 1).value = note
+    return row
+
+def _set_kv(ws, key, value, key_col=1, value_col=2, num_fmt=None):
     row = _find_key_row(ws, key, key_col=key_col)
-    ws.cell(row=row, column=value_col).value = value
+    cell = ws.cell(row=row, column=value_col)
+    cell.value = value
+    if num_fmt:
+        cell.number_format = num_fmt
 
 def _clear_kv(ws, key, key_col=1, value_col=2):
     row = _find_key_row(ws, key, key_col=key_col)
@@ -1192,12 +1255,8 @@ def _rollforward_snapshot(data, months):
     total_net = sum(m["net_income"] for m in months)
     total_payouts = sum(m["payouts"] for m in months)
 
-    existing_yield = _num_or_none(data.get("cumulative", {}).get("annualized_yield"))
-    property_value = (
-        _num_or_none(info.get("property_value"))
-        or _num_or_none(info.get("estimated_property_value"))
-        or _num_or_none(info.get("investment_value"))
-    )
+    existing_yield = _ratio_or_none(data.get("cumulative", {}).get("annualized_yield"))
+    property_value = _property_purchase_price(info)
     annualized_yield = existing_yield
     if property_value and property_value > 0 and months:
         annualized_yield = (total_net / property_value) * (12 / len(months))
@@ -1231,6 +1290,10 @@ def _rollforward_snapshot(data, months):
         },
         "cash_balance": {
             "opening_balance": _round_money(cur["closing_bal"]),
+            "total_income": 0,
+            "total_mgmt_fee": 0,
+            "total_opex": 0,
+            "total_payouts": 0,
         },
     }
 
@@ -1242,10 +1305,9 @@ def generate_next_input_template(input_path, output_path=None):
     re-enters manually:
     - Prior_Period receives current month KPIs;
     - Cumulative receives recomputed management-to-date totals;
-    - Cash_Balance receives opening_balance = current closing_balance.
-
-    The month activity fields in Cash_Balance are cleared because they belong
-    to the next reporting month and must be populated by the next source pack.
+    - Cash_Balance receives opening_balance = current closing_balance and
+      zero monthly rows for the new period, so the balance control is explicit
+      rather than blank.
     """
     data = read_input(input_path)
     info = data["info"]
@@ -1271,23 +1333,43 @@ def generate_next_input_template(input_path, output_path=None):
     snapshot = _rollforward_snapshot(data, months)
 
     # Property_Info: the workbook becomes the next reporting period.
-    _set_kv(wb["Property_Info"], "period", next_period)
+    ws_info = wb["Property_Info"]
+    _set_kv(ws_info, "period", next_period)
+    _ensure_kv(
+        ws_info,
+        "asset_purchase_price",
+        note="Стоимость покупки управляемой единицы (THB). Используется для annualized_yield.",
+    )
 
     # Prior_Period: current closed month becomes the previous month for MoM.
     ws_prior = wb["Prior_Period"]
     for key, value in snapshot["prior_period"].items():
-        _set_kv(ws_prior, key, value)
+        num_fmt = "0.00%" if key == "occupancy_pct" else None
+        _set_kv(ws_prior, key, value, num_fmt=num_fmt)
+    _set_kv(
+        ws_prior,
+        "occupancy_pct",
+        "Occupancy % предыдущего месяца",
+        value_col=3,
+    )
 
     # Cumulative: recompute through the current closed month.
     ws_cumul = wb["Cumulative"]
     for key, value in snapshot["cumulative"].items():
-        _set_kv(ws_cumul, key, value)
+        num_fmt = "0.00%" if key == "annualized_yield" else None
+        _set_kv(ws_cumul, key, value, num_fmt=num_fmt)
+    _set_kv(
+        ws_cumul,
+        "annualized_yield",
+        "Годовая доходность (%): Net Income / asset_purchase_price × 12 / months",
+        value_col=3,
+    )
 
-    # Cash_Balance: only the next opening balance is known at rollforward time.
+    # Cash_Balance: next period starts from the closed period balance.
     ws_cash = wb["Cash_Balance"]
-    _set_kv(ws_cash, "opening_balance", snapshot["cash_balance"]["opening_balance"])
+    _set_kv(ws_cash, "opening_balance", snapshot["cash_balance"]["opening_balance"], num_fmt="#,##0.00")
     for key in ("total_income", "total_mgmt_fee", "total_opex", "total_payouts"):
-        _clear_kv(ws_cash, key)
+        _set_kv(ws_cash, key, snapshot["cash_balance"][key], num_fmt="#,##0.00")
 
     output_name = _next_input_filename(input_path, current_period, next_period)
     metadata = {
