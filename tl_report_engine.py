@@ -1242,7 +1242,7 @@ def _rollforward_snapshot(data, months):
     The carry-forward rule is intentionally narrow:
     - current month KPI/result values go to Prior_Period;
     - cumulative values are recomputed through the current closed month;
-    - current closing balance becomes the next month's opening balance.
+    - Cash_Balance gets the full closed-month balance control values.
     """
     info = data["info"]
     cur = months[-1]
@@ -1289,11 +1289,12 @@ def _rollforward_snapshot(data, months):
             "months_managed": len(months),
         },
         "cash_balance": {
-            "opening_balance": _round_money(cur["closing_bal"]),
-            "total_income": 0,
-            "total_mgmt_fee": 0,
-            "total_opex": 0,
-            "total_payouts": 0,
+            "opening_balance": _round_money(cur["opening_bal"]),
+            "total_income": _round_money(cur["gross"] + cur["utility"]),
+            "total_mgmt_fee": _round_money(-cur["tl_comm"]),
+            "total_opex": _round_money(-cur["opex"]),
+            "total_payouts": _round_money(-cur["payouts"]),
+            "closing_balance": _round_money(cur["closing_bal"]),
         },
     }
 
@@ -1305,9 +1306,8 @@ def generate_next_input_template(input_path, output_path=None):
     re-enters manually:
     - Prior_Period receives current month KPIs;
     - Cumulative receives recomputed management-to-date totals;
-    - Cash_Balance receives opening_balance = current closing_balance and
-      zero monthly rows for the new period, so the balance control is explicit
-      rather than blank.
+    - Cash_Balance receives the full closed-month balance control:
+      opening balance, income, fee, opex, payouts, and closing balance.
     """
     data = read_input(input_path)
     info = data["info"]
@@ -1365,18 +1365,19 @@ def generate_next_input_template(input_path, output_path=None):
         value_col=3,
     )
 
-    # Cash_Balance: next period starts from the closed period balance.
+    # Cash_Balance: full balance control for the closed period.
     ws_cash = wb["Cash_Balance"]
     _set_kv(ws_cash, "opening_balance", snapshot["cash_balance"]["opening_balance"], num_fmt="#,##0.00")
     for key in ("total_income", "total_mgmt_fee", "total_opex", "total_payouts"):
         _set_kv(ws_cash, key, snapshot["cash_balance"][key], num_fmt="#,##0.00")
+    _set_kv(ws_cash, "closing_balance", snapshot["cash_balance"]["closing_balance"], num_fmt="#,##0.00")
 
     output_name = _next_input_filename(input_path, current_period, next_period)
     metadata = {
         "current_period": current_period,
         "next_period": next_period,
         "next_input_name": output_name,
-        "opening_balance": snapshot["cash_balance"]["opening_balance"],
+        "opening_balance": snapshot["cash_balance"]["closing_balance"],
         "warnings": warnings,
     }
 
