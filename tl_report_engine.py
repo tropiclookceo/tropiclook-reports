@@ -39,13 +39,28 @@ CAT_NAMES = {
     "WASTE":"Вывоз мусора","FFE-EQUIP":"Оборудование и инвентарь",
     "GUEST-SVC":"Гостевой сервис","TAXES-PRP":"Налог на имущество",
     "MISC":"Прочее","ADJ":"Корректировки",
+    "FIX-GARDEN":"Обслуживание сада",
+    "MNT-MAIN":"Регулярное техническое обслуживание",
+    "FIX-PEST":"Пест-контроль",
+    "FIX-SEC":"Охрана / CCTV",
+    "FIX-INS":"Страховка объекта",
+    "CLN-REG":"Регулярная уборка",
+    "CLN-DEEP":"Генеральная уборка",
+    "CLN-DRY":"Химчистка",
+    "CLN-LNDRY":"Стирка белья и полотенец",
+    "CLN-CHEM":"Химия и расходники для уборки",
+    "MNT-AC":"Чистка кондиционеров",
+    "MNT-SEPTIC":"Очистка септика",
 }
 
 BUDGET_ORDER = [
-    "FIX-POOL","FIX-Garden","FIX-MAIN","FIX-CLEAN","FIX-INET","FIX-COM",
-    "VAR-CLEAN","VAR-LNDRY","VAR-CHEM","VAR-WELC",
-    "UTL-ELEC","UTL-WAT","MNT-REPAIR","EMRG","WASTE","FFE-EQUIP",
-    "GUEST-SVC","TAXES-PRP","MISC","ADJ",
+    "FIX-POOL","FIX-GARDEN","FIX-Garden","MNT-MAIN","FIX-MAIN",
+    "FIX-INET","FIX-COM","FIX-PEST","FIX-SEC","FIX-INS",
+    "CLN-REG","FIX-CLEAN","CLN-DEEP","CLN-DRY","CLN-LNDRY","CLN-CHEM",
+    "VAR-CLEAN","VAR-LNDRY","VAR-CHEM",
+    "UTL-ELEC","UTL-WAT","MNT-AC","MNT-SEPTIC","MNT-REPAIR","EMRG",
+    "WASTE","TAXES-PRP","ADJ",
+    "VAR-WELC","FFE-EQUIP","GUEST-SVC","MISC",
 ]
 
 
@@ -77,21 +92,46 @@ def _pct(val):
     return f"{int(round(val * 100))}%"
 
 def _num_or_none(val):
-    """Best-effort numeric parser for optional template values."""
+    """Best-effort numeric parser for optional template values.
+
+    Accepts both English and European/Thai finance formats:
+    788.37, 788,37, 1,200.50, 1.200,50, 1 200,50.
+    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
-        v = val.strip().replace(",", "").replace(" ", "")
-        v = re.sub(r"[^\d.\-]", "", v)
+        v = (
+            val.strip()
+            .replace("\u00a0", "")
+            .replace("\u202f", "")
+            .replace(" ", "")
+        )
+        v = re.sub(r"[^\d,.\-]", "", v)
         if not v:
             return None
+        if "," in v and "." in v:
+            if v.rfind(",") > v.rfind("."):
+                v = v.replace(".", "").replace(",", ".")
+            else:
+                v = v.replace(",", "")
+        elif "," in v:
+            parts = v.split(",")
+            if len(parts) == 2:
+                left, right = parts
+                v = f"{left}.{right}" if 0 < len(right) <= 2 else left + right
+            else:
+                v = "".join(parts[:-1]) + "." + parts[-1] if len(parts[-1]) <= 2 else "".join(parts)
         try:
             return float(v)
         except ValueError:
             return None
     return None
+
+def _num(val, default=0.0):
+    parsed = _num_or_none(val)
+    return default if parsed is None else parsed
 
 def _row_value(row, idx, default=None):
     """Safely read an optional cell from an openpyxl values_only row tuple."""
@@ -113,7 +153,7 @@ def _ratio_or_none(val):
     return num
 
 def _round_money(val):
-    return round(float(val or 0), 2)
+    return round(_num(val), 2)
 
 def _property_purchase_price(info):
     """Return the managed unit purchase price used for annualized yield."""
@@ -235,7 +275,7 @@ def read_input(path):
         if not row or len(row) < 2: continue
         date_val = _to_date(row[0])
         if not date_val: continue
-        amount = _num_or_none(_row_value(row, 1, 0)) or 0
+        amount = _num(_row_value(row, 1, 0))
         pay.append({
             "date": date_val, "amount": amount,
             "type": _row_value(row, 2, "") or "",
@@ -252,10 +292,7 @@ def read_input(path):
         if str(row[0]).startswith("NOTES"): break
         code = str(row[0]).strip()
         raw = row[1] if len(row) > 1 else None
-        amt = 0.0
-        if isinstance(raw, (int, float)):
-            amt = float(raw)
-        budget[code] = amt
+        budget[code] = _num(raw)
     data["budget"] = budget
 
     # Cumulative (for DAP)
@@ -345,7 +382,7 @@ def compute_monthly(data, mgmt_start, rpt_year, rpt_month):
     # Opening balance at management start
     info = data["info"]
     opening_key = [k for k in info if "beginning" in k.lower() or "opening" in k.lower()]
-    opening_bal = float(info.get(opening_key[0], 0)) if opening_key else 877089.71
+    opening_bal = _num(info.get(opening_key[0], 0), 877089.71) if opening_key else 877089.71
 
     months = []
     prev_closing = opening_bal
@@ -354,16 +391,16 @@ def compute_monthly(data, mgmt_start, rpt_year, rpt_month):
         # Revenue: checkout date in this month
         bk = [r for r in data["reservations"]
               if r["checkout_date"].year == yr and r["checkout_date"].month == mo]
-        gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
-        utility = sum(float(r.get("utility_charge") or 0) for r in bk)
-        tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
+        gross   = sum(_num(r.get("gross_amount")) for r in bk)
+        utility = sum(_num(r.get("utility_charge")) for r in bk)
+        tl_comm = sum(_num(r.get("tl_commission")) for r in bk)
         bookings_count = len(bk)
-        nights_occupied = sum(float(r.get("nights") or 0) for r in bk)
+        nights_occupied = sum(_num(r.get("nights")) for r in bk)
 
         # OPEX: expense date in this month
         ex = [e for e in data["expenses"]
               if e["date"].year == yr and e["date"].month == mo]
-        opex = sum(float(e.get("amount") or 0) for e in ex)
+        opex = sum(_num(e.get("amount")) for e in ex)
 
         # Payouts: payout date in this month
         py = [p for p in data["payouts"]
@@ -411,19 +448,19 @@ def build_dashboard(wb, data, rpt_year, rpt_month, cur_month):
     prop_type  = info.get("property_type", "")
     bedrooms   = info.get("bedrooms", "")
     location   = info.get("location", "")
-    comm_rate  = float(info.get("commission_rate", 0.25))
+    comm_rate  = _num(info.get("commission_rate"), 0.25)
 
     period_label = f"{MONTHS_RU[rpt_month]} {rpt_year}"
 
     # Current month bookings (checkout-based)
     bk = [r for r in data["reservations"]
           if r["checkout_date"].year == rpt_year and r["checkout_date"].month == rpt_month]
-    gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
-    utility = sum(float(r.get("utility_charge") or 0) for r in bk)
-    tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
+    gross   = sum(_num(r.get("gross_amount")) for r in bk)
+    utility = sum(_num(r.get("utility_charge")) for r in bk)
+    tl_comm = sum(_num(r.get("tl_commission")) for r in bk)
 
     ex = [e for e in data["expenses"] if e["date"].year == rpt_year and e["date"].month == rpt_month]
-    opex = sum(float(e.get("amount") or 0) for e in ex)
+    opex = sum(_num(e.get("amount")) for e in ex)
 
     net_income  = gross + utility - tl_comm - opex
     opening_bal = cur_month["opening_bal"]
@@ -432,7 +469,7 @@ def build_dashboard(wb, data, rpt_year, rpt_month, cur_month):
     closing_bal = cur_month["closing_bal"]
 
     days_in_month    = _month_days(rpt_year, rpt_month)
-    nights_occupied  = sum(float(r.get("nights") or 0) for r in bk)
+    nights_occupied  = sum(_num(r.get("nights")) for r in bk)
     occupancy        = nights_occupied / days_in_month if days_in_month > 0 else 0
     adr              = gross / nights_occupied if nights_occupied > 0 else 0
     expense_ratio    = opex / gross if gross > 0 else 0
@@ -513,7 +550,7 @@ def build_dashboard(wb, data, rpt_year, rpt_month, cur_month):
         dates = f"{ci}—{co} (доход: {co})"
         row_vals = [
             r.get("booking_id", ""), r.get("channel", ""), r.get("guest_name", ""),
-            dates, int(r.get("nights") or 0), int(r.get("gross_amount") or 0)
+            dates, int(_num(r.get("nights"))), int(_num(r.get("gross_amount")))
         ]
         fill = _fill(LIGHT_BG) if ri % 2 == 0 else _fill(WHITE)
         for i, v in enumerate(row_vals, 2):
@@ -542,11 +579,11 @@ def build_pl(wb, data, rpt_year, rpt_month, cur_month):
     py = [p for p in data["payouts"]
           if p["date"].year == rpt_year and p["date"].month == rpt_month]
 
-    gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
-    utility = sum(float(r.get("utility_charge") or 0) for r in bk)
-    tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
-    ota_comm = sum(float(r.get("ota_commission") or 0) for r in bk)
-    opex    = sum(float(e.get("amount") or 0) for e in ex)
+    gross   = sum(_num(r.get("gross_amount")) for r in bk)
+    utility = sum(_num(r.get("utility_charge")) for r in bk)
+    tl_comm = sum(_num(r.get("tl_commission")) for r in bk)
+    ota_comm = sum(_num(r.get("ota_commission")) for r in bk)
+    opex    = sum(_num(e.get("amount")) for e in ex)
     payouts = sum(p["amount"] for p in py)
     net_income  = gross + utility - tl_comm - opex
     closing_bal = cur_month["closing_bal"]
@@ -557,7 +594,7 @@ def build_pl(wb, data, rpt_year, rpt_month, cur_month):
     opex_count  = 0
     for e in ex:
         cat = str(e.get("category_code") or "MISC").strip()
-        opex_by_cat[cat] += float(e.get("amount") or 0)
+        opex_by_cat[cat] += _num(e.get("amount"))
         opex_count += 1
 
     row = 1
@@ -622,8 +659,8 @@ def build_pl(wb, data, rpt_year, rpt_month, cur_month):
     for r in bk:
         bid   = r.get("booking_id", "")
         ch    = r.get("channel", "")
-        nights = int(r.get("nights") or 0)
-        amt   = float(r.get("gross_amount") or 0)
+        nights = int(_num(r.get("nights")))
+        amt   = _num(r.get("gross_amount"))
         write(next_row(), str(bid), amt, f"{ch}, {nights}н", indent=True)
     if utility > 0:
         write(next_row(), "Возмещение электричества", utility, "Utility recharge", indent=True)
@@ -631,11 +668,11 @@ def build_pl(wb, data, rpt_year, rpt_month, cur_month):
 
     # COMMISSION
     write_section(next_row(), "КОМИССИЯ TROPICLOOK")
-    comm_rate = float(info.get("commission_rate", 0.25))
+    comm_rate = _num(info.get("commission_rate"), 0.25)
     for r in bk:
         bid   = r.get("booking_id", "")
-        amt   = float(r.get("gross_amount") or 0)
-        tl    = float(r.get("tl_commission") or 0)
+        amt   = _num(r.get("gross_amount"))
+        tl    = _num(r.get("tl_commission"))
         pct   = tl/amt*100 if amt > 0 else comm_rate*100
         write(next_row(), str(bid), -tl, f"{pct:.1f}% от {gross_fmt(amt)}", indent=True)
     if ota_comm > 0:
@@ -735,7 +772,7 @@ def build_opex_passport(wb, data, rpt_year, rpt_month):
     opex_by_cat = defaultdict(float)
     for e in ex:
         cat = str(e.get("category_code") or "MISC").strip()
-        opex_by_cat[cat] += float(e.get("amount") or 0)
+        opex_by_cat[cat] += _num(e.get("amount"))
 
     all_cats = list(BUDGET_ORDER)
     for cat in opex_by_cat:
@@ -914,7 +951,7 @@ def build_ledger(wb, data, rpt_year, rpt_month, cur_month):
             "date": e["date"],
             "desc": (e.get("description") or "")[:55],
             "cat":  cat,
-            "debit": float(e.get("amount") or 0),
+            "debit": _num(e.get("amount")),
             "credit": 0,
             "sort": 1,
         })
@@ -925,9 +962,9 @@ def build_ledger(wb, data, rpt_year, rpt_month, cur_month):
     for r in bk:
         co   = r["checkout_date"]
         bid  = str(r.get("booking_id", ""))
-        gross = float(r.get("gross_amount") or 0)
-        tl    = float(r.get("tl_commission") or 0)
-        util  = float(r.get("utility_charge") or 0)
+        gross = _num(r.get("gross_amount"))
+        tl    = _num(r.get("tl_commission"))
+        util  = _num(r.get("utility_charge"))
         if gross > 0:
             transactions.append({"date": co, "desc": f"Приход: {bid} (выезд — checkout)",
                                   "cat": "REVENUE", "credit": gross, "debit": 0, "sort": 2})
@@ -1137,7 +1174,7 @@ def build_dap(wb, data, rpt_year, rpt_month, months):
 def validate(data, rpt_year, rpt_month, cur_month):
     errors = []; warnings = []
     info = data["info"]
-    comm_rate = float(info.get("commission_rate", 0.25))
+    comm_rate = _num(info.get("commission_rate"), 0.25)
     # Non-blocking by default to avoid stopping the pipeline on CFO-escalation cases.
     block_on_negative_balance = _to_bool(info.get("block_on_negative_balance"), default=False)
 
@@ -1148,10 +1185,10 @@ def validate(data, rpt_year, rpt_month, cur_month):
     py = [p for p in data["payouts"]
           if p["date"].year == rpt_year and p["date"].month == rpt_month]
 
-    gross   = sum(float(r.get("gross_amount") or 0) for r in bk)
-    utility = sum(float(r.get("utility_charge") or 0) for r in bk)
-    tl_comm = sum(float(r.get("tl_commission") or 0) for r in bk)
-    opex    = sum(float(e.get("amount") or 0) for e in ex)
+    gross   = sum(_num(r.get("gross_amount")) for r in bk)
+    utility = sum(_num(r.get("utility_charge")) for r in bk)
+    tl_comm = sum(_num(r.get("tl_commission")) for r in bk)
+    opex    = sum(_num(e.get("amount")) for e in ex)
     payouts = sum(p["amount"] for p in py)
     net     = gross + utility - tl_comm - opex
     closing = cur_month["closing_bal"]
