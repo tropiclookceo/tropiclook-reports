@@ -93,6 +93,10 @@ def _num_or_none(val):
             return None
     return None
 
+def _row_value(row, idx, default=None):
+    """Safely read an optional cell from an openpyxl values_only row tuple."""
+    return row[idx] if len(row) > idx else default
+
 def _ratio_or_none(val):
     """
     Parse a percent-like value as a spreadsheet ratio.
@@ -231,10 +235,12 @@ def read_input(path):
         if not row or len(row) < 2: continue
         date_val = _to_date(row[0])
         if not date_val: continue
+        amount = _num_or_none(_row_value(row, 1, 0)) or 0
         pay.append({
-            "date": date_val, "amount": float(row[1] or 0),
-            "type": row[2], "reference": row[3],
-            "description": row[4] or "",
+            "date": date_val, "amount": amount,
+            "type": _row_value(row, 2, "") or "",
+            "reference": _row_value(row, 3, "") or "",
+            "description": _row_value(row, 4, "") or "",
         })
     data["payouts"] = pay
 
